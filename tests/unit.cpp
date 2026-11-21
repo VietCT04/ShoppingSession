@@ -36,6 +36,11 @@ int main(){try{
     for(size_t i=0;i<keys.size();++i)require(map.try_emplace(keys[i],i).second,"flat insert");
     for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
     require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
+    map.freeze();
+    for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"tagged probe finds exact keys");
+    for(size_t i=0;i<10000;++i)require(!map.find("missing key "+std::to_string(i)),"tagged probe rejects absent keys");
+    require(map.try_emplace("insert after freeze",112).second&&map.find("insert after freeze")->second==112,
+            "insertion invalidates read-only probe metadata");
     std::mt19937_64 rng(938151);
     {
         StrictTimeParser parser;parser.init(timestamp("2028-02-20T00:00:00Z"),timestamp("2028-03-05T00:00:00Z"));

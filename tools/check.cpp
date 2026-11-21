@@ -151,8 +151,13 @@ int main(int argc,char** argv) {
             const auto ingest_control=configs.back().flags;
             configs.push_back({"ingest-256",ingest_control});
             configs.back().flags.insert(configs.back().flags.end(),{"--ingest-shards","256"});
+            const auto tier_control=configs.back().flags;
+            configs.push_back({"tag-links",tier_control});
+            configs.back().flags.push_back("--tag-links");
             configs.push_back({"avx2-csv",configs.back().flags});
             configs.back().flags.push_back("--avx2-csv");
+            configs.push_back({"heavy-shards",tier_control});
+            configs.back().flags.push_back("--heavy-shards-first");
             configs.push_back({"ingest-1024",ingest_control});
             configs.back().flags.insert(configs.back().flags.end(),{"--ingest-shards","1024"});
             configs.push_back({"direct-dedup",narrow_control});
@@ -178,7 +183,7 @@ int main(int argc,char** argv) {
                     std::vector<std::string> args={binary?binary:"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
                     // Matrix entries start from fixed defaults rather than the
                     // tuned production defaults. Explicit flags override these.
-                    args.insert(args.begin()+3,{"--ingest-shards","0","--no-overlap-links","--no-direct-encoding","--wide-events","--no-fast-time","--no-compact","--no-array-active","--no-array-categories","--dedup-shards","0","--no-fused-csv","--no-group-person","--no-dense-totals","--sorter","std"});
+                    args.insert(args.begin()+3,{"--no-tag-links","--ingest-shards","0","--no-overlap-links","--no-direct-encoding","--wide-events","--no-fast-time","--no-compact","--no-array-active","--no-array-categories","--dedup-shards","0","--no-fused-csv","--no-group-person","--no-dense-totals","--sorter","std"});
                     auto log=fs::path("benchmarks")/(config.name+"-"+std::to_string(i)+".log");
                     auto r=run(args,log);compare(db,out,argv[3]);times[index].push_back(r.seconds);
                     auto timestamp=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
