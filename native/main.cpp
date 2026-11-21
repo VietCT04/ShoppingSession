@@ -87,7 +87,7 @@ struct Options {
     bool narrow_events=true;
     bool direct_dedup=false,direct_encoding=true;
     bool overlap_links=true;
-    bool avx2_csv=false;
+    bool avx2_csv=true;
     bool tag_links=true,heavy_shards_first=false;
     std::string dedup="flat";
     std::string sorter="duckdb";
@@ -126,6 +126,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--overlap-links")o.overlap_links=true;
         else if(arg=="--no-overlap-links")o.overlap_links=false;
         else if(arg=="--avx2-csv")o.avx2_csv=true;
+        else if(arg=="--no-avx2-csv")o.avx2_csv=false;
         else if(arg=="--tag-links")o.tag_links=true;
         else if(arg=="--no-tag-links")o.tag_links=false;
         else if(arg=="--heavy-shards-first")o.heavy_shards_first=true;
@@ -257,7 +258,7 @@ struct Pipeline {
     }
     template<size_t N,class F>void records(Chunk chunk,F consume)const {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-        if(o.avx2_csv&&avx2_csv_available()) {
+        if(o.fused_csv&&o.avx2_csv&&avx2_csv_available()) {
             scan_csv_avx2<N>(chunk,consume);
             return;
         }
