@@ -490,7 +490,7 @@ struct Pipeline {
             records<4>(in.clicks[i],[&](const std::array<SV,4>& f){
                 if(f[0].empty()||f[1].empty())return;
                 auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
-                auto ts=parse_time(f[3]);if(ts<start-WEEK||ts>=end)return;
+                auto ts=parse_time(f[3]);if(ts==-1||ts<start-WEEK||ts>=end)return;
                 auto person=canonical(Key(f[1]));
                 size_t destination=shard(person);
                 Key id(f[0]);
