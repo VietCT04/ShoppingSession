@@ -259,3 +259,10 @@ The complete local per-run records and phase profiles are in the ignored
 `benchmarks/` directory. Use the same CPU affinity, dataset, build flags, and
 repeat count when comparing candidates. Docker is unavailable on the current
 host, so the scorer-style container flags have not yet been executed locally.
+
+GCC profile-guided optimization trained on the public seed-1 dev input
+improved all ten paired timings on the separate seed-7 20M dataset across
+two batches. The trained and ordinary builds took **1.498 vs. 1.570 seconds**
+in the first batch and **1.898 vs. 2.004 seconds** in the second. Both builds
+produced exact results on every run. The trained executable also passed the
+36 official fixtures and the dev answers. Build it with `make pgo PGO_DATA=data/dev`.
