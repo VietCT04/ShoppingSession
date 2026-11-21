@@ -424,3 +424,8 @@ same alternating batch. Every output matched the reference, and the
 profile-guided binary passed all 36 fixtures, the official dev comparison,
 and a separate default-settings 20M run. This observed median is within
 normal run-to-run variation of the earlier 0.979-second result.
+
+A separate five-pair comparison of the current and previous profile-guided
+builds measured **0.953 vs 1.040 seconds** on the same pinned CPUs. All ten
+20M outputs matched. The current build includes the smaller validation path,
+reserved routing vectors, and the UTC date cache.
