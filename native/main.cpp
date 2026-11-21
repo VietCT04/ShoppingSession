@@ -4,6 +4,7 @@
 #include "sort.hpp"
 #include "id.hpp"
 #include "csv_scan.hpp"
+#include "ingest_order.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
 #ifdef SHOP_IPS_SORTS
 #include "ips4o.hpp"
@@ -73,6 +74,7 @@ struct Options {
     bool dense_totals=true;
     bool group_person=true;
     bool fused_csv=true;
+    bool ordered_ingest=false;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -95,6 +97,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-group-person")o.group_person=false;
         else if(arg=="--fused-csv")o.fused_csv=true;
         else if(arg=="--no-fused-csv")o.fused_csv=false;
+        else if(arg=="--ordered-ingest")o.ordered_ingest=true;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup"&&i+1<argc)o.dedup=argv[++i];
@@ -106,7 +109,7 @@ Options options(int argc,char** argv) {
         else if(positional==2)o.out=arg;
         else throw std::runtime_error("too many paths");
     }
-    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.fused_csv=false;o.sorter="std";}
+    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.fused_csv=false;o.ordered_ingest=false;o.sorter="std";}
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat"&&o.dedup!="dense")throw std::runtime_error("dedup must be sort, hash, flat, or dense");
     if(o.sorter!="std"&&o.sorter!="duckdb")throw std::runtime_error("sorter must be std or duckdb");
@@ -124,6 +127,7 @@ struct Pipeline {
     Dict<uint32_t> products,campaigns,category_index;
     std::vector<SV> categories={"unknown"},campaign_names={"organic"},channels={"organic"};
     int64_t start,end;
+    IngestOrder ingest_order;
     Workers<Raw> raw;
     Workers<Event> events;
     Workers<Click> clicks;
@@ -146,6 +150,7 @@ struct Pipeline {
         };
         start=window("window_start");end=window("window_end");
         if(start<0||end<=start)throw std::runtime_error("invalid manifest window");
+        if(o.ordered_ingest)ingest_order.init(start,end);
         std::vector<Chunk> lookup;
         in.add(o.data/"products.csv",lookup);
         category_index.emplace("unknown",0);
@@ -209,11 +214,11 @@ struct Pipeline {
                 if(f[0].empty())return;
                 // Invalid winners remain in the dedup input. A later valid copy
                 // must never rescue an invalid earliest copy.
-                int64_t ts=timestamp(f[2]),ingest=timestamp(f[3]);
+                int64_t ts=timestamp(f[2]),ingest=o.ordered_ingest?IngestOrder::pack(f[3]):timestamp(f[3]);
                 uint64_t price=0;uint32_t category=0;
                 bool purchase=f[4]=="purchase";
                 bool valid=!f[1].empty()&&!f[5].empty()&&(purchase||f[4]=="view"||f[4]=="cart")&&
-                    ts>=start&&ts<end&&ingest-ts<=DAY;
+                    ts>=start&&ts<end&&(o.ordered_ingest?ingest_order.on_time(ingest,ts):ingest-ts<=DAY);
                 if(purchase) {
                     valid=valid&&digits(f[6],price,10000000)&&price>0;
                     if(valid){auto it=products.find(f[5]);if(it!=products.end())category=it->second;}

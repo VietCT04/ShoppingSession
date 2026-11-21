@@ -3,7 +3,9 @@
 #include "../native/flat_map.hpp"
 #include "../native/id.hpp"
 #include "../native/csv_scan.hpp"
+#include "../native/ingest_order.hpp"
 #include <cstdlib>
+#include <cstdio>
 #include <random>
 using namespace shop;
 void require(bool v,const char* label){if(!v)throw std::runtime_error(label);}
@@ -33,6 +35,31 @@ int main(){try{
     for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
     require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
     std::mt19937_64 rng(938151);
+    {
+        auto format=[](int64_t epoch) {
+            int64_t day=dayof(epoch),second=(epoch-day*DAY)/1000;
+            std::chrono::year_month_day date{std::chrono::sys_days{std::chrono::days{day}}};
+            char out[32];std::snprintf(out,sizeof(out),"%04d-%02u-%02uT%02d:%02d:%02dZ",int(date.year()),unsigned(date.month()),unsigned(date.day()),int(second/3600),int(second/60%60),int(second%60));
+            return std::string(out);
+        };
+        for(SV start_text:{"2026-12-25T00:00:00Z","2028-02-20T00:00:00Z"}) {
+            auto start=timestamp(start_text),end=start+14*DAY;IngestOrder order;order.init(start,end);
+            for(size_t i=0;i<100000;++i) {
+                int64_t event_ts=start+int64_t(rng()%(end-start));
+                int64_t ingested=start-7*DAY+int64_t(rng()%(28*DAY));
+                ingested=ingested/1000*1000;
+                auto f1=format(ingested);
+                require(order.on_time(IngestOrder::pack(f1),event_ts)==(ingested-event_ts<=DAY),"ingest-order exact late cutoff");
+                auto other=format(ingested+int64_t(rng()%1000000)*1000);
+                require(IngestOrder::pack(f1)<IngestOrder::pack(other)||f1==other,"ingest-order monotonicity");
+            }
+            for(int64_t offset:{-1000LL,0LL,1LL,500LL,999LL,1000LL}) {
+                int64_t event_ts=start+500,ingested=(event_ts+DAY+offset)/1000*1000;
+                require(order.on_time(IngestOrder::pack(format(ingested)),event_ts)==(ingested-event_ts<=DAY),"ingest-order fractional boundary");
+            }
+        }
+        require(IngestOrder::pack("0000-01-01T00:00:00Z")<IngestOrder::pack("9999-12-31T23:59:59Z"),"ingest-order year range");
+    }
     for(size_t round=0;round<3000;++round) {
         std::string buffer;
         for(size_t row=0;row<20;++row) {

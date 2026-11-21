@@ -81,6 +81,13 @@ scanning is now the default; `--no-fused-csv` retains the old path. This is
 original C++ code inspired by the fused model in the csveee paper, not a claim
 to reproduce its server benchmark throughput.
 
+An independent ingestion-order-key experiment was written before inspecting
+the external competition reference. It preserves earliest-F1 ordering and the
+millisecond-exact late cutoff, and passes all 504 fixture/configuration checks
+plus the dev answers and randomized boundary checks. Alternating 20M medians
+were 4.548 seconds for the control and 4.694 for the experiment, so it remains
+disabled and has not replaced the validated production path.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
