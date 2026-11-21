@@ -70,7 +70,7 @@ template<class T> using Workers=std::vector<Buckets<T>>;
 
 struct Options {
     fs::path data="/data",out="/output";
-    int threads=8,shards=256,dedup_shards=4096,ingest_shards=0;
+    int threads=8,shards=256,dedup_shards=4096,ingest_shards=-1;
     bool baseline=false;
 #ifdef SHOP_PACKED_IDS
     bool compact=false;
@@ -138,6 +138,7 @@ Options options(int argc,char** argv) {
     }
     if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.fused_csv=false;o.ordered_ingest=false;o.array_active=false;o.array_categories=false;o.sorter="std";}
     if(!o.dedup_shards||o.baseline)o.dedup_shards=o.shards;
+    if(o.ingest_shards==-1)o.ingest_shards=std::min(256,o.dedup_shards);
     if(!o.ingest_shards||o.baseline)o.ingest_shards=o.dedup_shards;
     if(o.baseline)o.fast_time=false;
     if(o.baseline)o.overlap_links=false;
@@ -323,22 +324,22 @@ struct Pipeline {
         });
     }
     template<class Emit> void dedup_rows(std::vector<Raw>& rows,Emit emit) {
-            if(o.dedup=="dense") {
-                ankerl::unordered_dense::map<Key,size_t,DenseKeyHash> winners;winners.reserve(rows.size());
-                for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
-                for(auto [id,i]:winners)emit(rows[i]);
-            } else if(o.dedup=="flat") {
-                KeyFlatMap<size_t> winners;winners.reserve(rows.size());
-                for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
-                winners.each([&](Key,size_t i){emit(rows[i]);});
-            } else if(o.dedup=="hash") {
-                KeyDict<size_t> winners;winners.reserve(rows.size());
-                for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
-                for(auto [id,i]:winners)emit(rows[i]);
-            } else {
-                std::sort(rows.begin(),rows.end(),[](const Raw& a,const Raw& b){return a.id!=b.id?a.id<b.id:a.ingest<b.ingest;});
-                for(size_t i=0;i<rows.size();){emit(rows[i]);size_t j=i+1;while(j<rows.size()&&rows[j].id==rows[i].id)++j;i=j;}
-            }
+        if(o.dedup=="dense") {
+            ankerl::unordered_dense::map<Key,size_t,DenseKeyHash> winners;winners.reserve(rows.size());
+            for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
+            for(auto [id,i]:winners)emit(rows[i]);
+        } else if(o.dedup=="flat") {
+            KeyFlatMap<size_t> winners;winners.reserve(rows.size());
+            for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
+            winners.each([&](Key,size_t i){emit(rows[i]);});
+        } else if(o.dedup=="hash") {
+            KeyDict<size_t> winners;winners.reserve(rows.size());
+            for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
+            for(auto [id,i]:winners)emit(rows[i]);
+        } else {
+            std::sort(rows.begin(),rows.end(),[](const Raw& a,const Raw& b){return a.id!=b.id?a.id<b.id:a.ingest<b.ingest;});
+            for(size_t i=0;i<rows.size();){emit(rows[i]);size_t j=i+1;while(j<rows.size()&&rows[j].id==rows[i].id)++j;i=j;}
+        }
     }
     void parse_clicks() {
         parallel(in.clicks.size(),o.threads,[&](size_t i,int worker){
