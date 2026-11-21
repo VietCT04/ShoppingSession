@@ -177,6 +177,13 @@ versus **2.837 s** with all rows entering the table. Every run matched, includin
 the official dev output and a duplicate-heavy test with an invalid winner.
 Use `--no-sparse-duplicates` for the ordinary dedup table.
 
+The raw event now fits in 48 bytes by storing window-relative event time
+and combining the category number and purchase price into one word. Ingest
+time keeps its original width. Long windows and dictionaries with more than
+256 categories use the 56-byte layout automatically. Five alternating pinned
+20M runs measured **2.597 s** versus **2.669 s**, all exact. Peak RSS was about
+3,520 MiB versus 3,745 MiB. Use `--wide-raw` to force the wider layout.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

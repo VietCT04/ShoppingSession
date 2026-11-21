@@ -32,6 +32,14 @@ struct DenseKeyHash {
     size_t operator()(const Key& key)const noexcept {auto h=KeyHash{}(key);return h^(h>>32);}
 };
 struct Raw {Key id,person;int64_t ts,ingest;uint32_t price,category;};
+struct CompactRaw {
+    Key id,person;
+    int64_t ingest;
+    uint32_t offset,purchase;
+    static constexpr uint32_t invalid=UINT32_MAX;
+    static constexpr uint32_t price_mask=(1u<<24)-1;
+};
+static_assert(sizeof(CompactRaw)==48);
 struct Event {
     Key person;int64_t ts;uint32_t price,category;
     bool operator<(const Event& b)const{return person!=b.person?person<b.person:ts<b.ts;}
@@ -90,6 +98,7 @@ struct Options {
     bool avx2_csv=true;
     bool tag_links=true,heavy_shards_first=false;
     bool sparse_duplicates=true;
+    bool compact_raw=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -133,6 +142,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--heavy-shards-first")o.heavy_shards_first=true;
         else if(arg=="--sparse-duplicates")o.sparse_duplicates=true;
         else if(arg=="--no-sparse-duplicates")o.sparse_duplicates=false;
+        else if(arg=="--compact-raw")o.compact_raw=true;
+        else if(arg=="--wide-raw")o.compact_raw=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -153,6 +164,7 @@ Options options(int argc,char** argv) {
     if(o.baseline)o.fast_time=false;
     if(o.baseline)o.overlap_links=false;
     if(o.baseline)o.tag_links=false;
+    if(o.baseline)o.compact_raw=false;
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup_shards<1||o.dedup_shards>16384||(o.dedup_shards&(o.dedup_shards-1)))throw std::runtime_error("dedup-shards must be a power of two in 1..16384");
     if(o.ingest_shards<1||o.ingest_shards>o.dedup_shards||(o.ingest_shards&(o.ingest_shards-1)))
@@ -175,13 +187,12 @@ struct Pipeline {
     int64_t start,end;
     IngestOrder ingest_order;
     StrictTimeParser strict_time;
-    Workers<Raw> raw;
     Workers<Event> events;
     Workers<Click> clicks;
     std::vector<CampaignTotals> totals;
     std::vector<std::vector<Aggregate>> dense_totals;
     std::vector<WorkProfile> profiles;
-    explicit Pipeline(Options options):o(std::move(options)),raw(o.threads,Buckets<Raw>(o.ingest_shards)),
+    explicit Pipeline(Options options):o(std::move(options)),
         events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
     using Clock=std::chrono::steady_clock;
     static double elapsed(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
@@ -270,7 +281,7 @@ struct Pipeline {
         else Inputs::lines(chunk,[&](SV line){std::array<SV,N> fields;if(csv(line,fields))consume(fields);});
     }
     int64_t parse_time(SV s)const{return o.fast_time?strict_time.parse(s):timestamp(s);}
-    void parse_events() {
+    template<class R> void parse_events(Workers<R>& raw) {
         parallel(in.events.size()+size_t(o.overlap_links),o.threads,[&](size_t i,int worker){
             if(o.overlap_links) {
                 // This job owns the link graph. The other jobs carry raw user
@@ -296,37 +307,55 @@ struct Pipeline {
                 Key user_id(f[1]);
                 Key person=o.overlap_links?user_id:canonical(user_id);
                 size_t bucket=KeyHash{}(event_id)&(o.ingest_shards-1);
-                raw[worker][bucket].push_back({event_id,person,ts,ingest,uint32_t(price),category});
+                if constexpr(std::is_same_v<R,CompactRaw>) {
+                    uint32_t offset=valid?uint32_t(ts-start):CompactRaw::invalid;
+                    uint32_t purchase_info=(uint32_t(price)&CompactRaw::price_mask)|(category<<24);
+                    raw[worker][bucket].push_back({event_id,person,ingest,offset,purchase_info});
+                } else {
+                    raw[worker][bucket].push_back({event_id,person,ts,ingest,uint32_t(price),category});
+                }
             });
         });
     }
-    void dedup() {
+    template<class R> void dedup(Workers<R>& raw) {
         parallel(o.ingest_shards,o.threads,[&](size_t s,int worker){
             size_t count=0;for(auto& w:raw)count+=w[s].size();
             if(!count)return;
-            auto emit=[&](const Raw& r) {
-                if(r.ts<start)return;
+            auto emit=[&](const R& r) {
+                int64_t ts;
+                uint32_t price,category;
+                if constexpr(std::is_same_v<R,CompactRaw>) {
+                    if(r.offset==CompactRaw::invalid)return;
+                    ts=start+r.offset;
+                    price=r.purchase&CompactRaw::price_mask;
+                    category=r.purchase>>24;
+                } else {
+                    if(r.ts<start)return;
+                    ts=r.ts;
+                    price=r.price;
+                    category=r.category;
+                }
                 Key person=o.overlap_links?canonical(r.person):r.person;
-                events[worker][shard(person)].push_back({person,r.ts,r.price,r.category});
+                events[worker][shard(person)].push_back({person,ts,price,category});
             };
             if(o.ingest_shards!=o.dedup_shards) {
                 size_t partitions=o.dedup_shards/o.ingest_shards;
                 size_t bits=std::countr_zero(unsigned(o.ingest_shards));
-                std::vector<std::vector<Raw>> subpartitions(partitions);
+                std::vector<std::vector<R>> subpartitions(partitions);
                 size_t average=count/partitions;
                 for(auto& rows:subpartitions)rows.reserve(average+average/8+16);
                 for(auto& buckets:raw) {
-                    for(const Raw& row:buckets[s]) {
+                    for(const R& row:buckets[s]) {
                         size_t subpartition=event_shard(row.id)>>bits;
                         subpartitions[subpartition].push_back(row);
                     }
-                    std::vector<Raw>().swap(buckets[s]);
+                    std::vector<R>().swap(buckets[s]);
                 }
                 for(auto& rows:subpartitions)if(!rows.empty())dedup_rows(rows,emit);
                 return;
             }
             if(o.direct_dedup&&o.dedup=="flat") {
-                KeyFlatMap<const Raw*> winners;
+                KeyFlatMap<const R*> winners;
                 winners.reserve(count);
                 for(const auto& buckets:raw) {
                     for(const auto& event:buckets[s]) {
@@ -334,16 +363,16 @@ struct Pipeline {
                         if(!inserted&&event.ingest<entry->second->ingest)entry->second=&event;
                     }
                 }
-                winners.each([&](const Key&,const Raw* event){emit(*event);});
-                for(auto& buckets:raw)std::vector<Raw>().swap(buckets[s]);
+                winners.each([&](const Key&,const R* event){emit(*event);});
+                for(auto& buckets:raw)std::vector<R>().swap(buckets[s]);
                 return;
             }
-            std::vector<Raw> rows;rows.reserve(count);
-            for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<Raw>().swap(w[s]);}
+            std::vector<R> rows;rows.reserve(count);
+            for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<R>().swap(w[s]);}
             dedup_rows(rows,emit);
         });
     }
-    template<class Emit> void dedup_rows(std::vector<Raw>& rows,Emit emit) {
+    template<class R,class Emit> void dedup_rows(std::vector<R>& rows,Emit emit) {
         if(o.sparse_duplicates&&o.dedup=="flat"&&rows.size()>=1024) {
             dedup_sparse(rows,emit);
             return;
@@ -361,11 +390,11 @@ struct Pipeline {
             for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
             for(auto [id,i]:winners)emit(rows[i]);
         } else {
-            std::sort(rows.begin(),rows.end(),[](const Raw& a,const Raw& b){return a.id!=b.id?a.id<b.id:a.ingest<b.ingest;});
+            std::sort(rows.begin(),rows.end(),[](const R& a,const R& b){return a.id!=b.id?a.id<b.id:a.ingest<b.ingest;});
             for(size_t i=0;i<rows.size();){emit(rows[i]);size_t j=i+1;while(j<rows.size()&&rows[j].id==rows[i].id)++j;i=j;}
         }
     }
-    template<class Emit> static void dedup_sparse(const std::vector<Raw>& rows,Emit emit) {
+    template<class R,class Emit> static void dedup_sparse(const std::vector<R>& rows,Emit emit) {
         // The bitmap can prove a hash tag occurs once. Shared tags always go
         // through exact key comparison, including collisions of distinct IDs.
         std::array<uint64_t,1024> seen{}, shared{};
@@ -637,11 +666,23 @@ struct Pipeline {
         for(auto [key,t]:all){auto [day,cam]=key;cols[0].text(campaign_names[cam]);cols[1].text(channels[cam]);cols[2].number(day);cols[3].number(t.sessions);cols[4].number(t.purchasing);cols[5].number(t.revenue);cols[6].number(t.assisted);}
         parquet::write((o.out/"campaign_daily"/"part-0.parquet").string(),cols);
     }
+    template<class R> void ingest_and_dedup(Timer& timer) {
+        Workers<R> raw(o.threads,Buckets<R>(o.ingest_shards));
+        parse_events(raw);
+        timer.mark(o.overlap_links?"parse_events_and_links":"parse_events");
+        dedup(raw);
+        timer.mark("dedup");
+    }
     void run(){
         Timer t(o.threads);
         load();t.mark(o.overlap_links?"load_inputs":"load_links");
-        parse_events();t.mark(o.overlap_links?"parse_events_and_links":"parse_events");
-        dedup();t.mark("dedup");
+        // Reserve one offset as an invalid-row marker and retain a wide path
+        // for long windows or product dictionaries with more categories.
+        if(o.compact_raw&&uint64_t(end-start)<=UINT32_MAX&&categories.size()<=256) {
+            ingest_and_dedup<CompactRaw>(t);
+        } else {
+            ingest_and_dedup<Raw>(t);
+        }
         parse_clicks();t.mark("parse_clicks");
         sessionize();t.mark("sessions_and_user_output");
         campaigns_output();t.mark("campaign_output");
