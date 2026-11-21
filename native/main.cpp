@@ -143,6 +143,7 @@ struct Options {
     bool narrow_duplicate_locations=true;
     bool branchless_event_validation=true;
     bool reserve_routes=true;
+    bool cache_utc_days=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -215,6 +216,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--conditional-event-validation")o.branchless_event_validation=false;
         else if(arg=="--reserve-routes")o.reserve_routes=true;
         else if(arg=="--grow-routes")o.reserve_routes=false;
+        else if(arg=="--cache-utc-days")o.cache_utc_days=true;
+        else if(arg=="--no-cache-utc-days")o.cache_utc_days=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -300,7 +303,7 @@ struct Pipeline {
         start=window("window_start");end=window("window_end");
         if(start<0||end<=start)throw std::runtime_error("invalid manifest window");
         if(o.ordered_ingest)ingest_order.init(start,end);
-        if(o.fast_time)strict_time.init(start,end);
+        if(o.fast_time)strict_time.init(start,end,o.cache_utc_days);
         std::vector<Chunk> lookup;
         in.add(o.data/"products.csv",lookup);
         category_index.emplace("unknown",0);
@@ -420,7 +423,7 @@ struct Pipeline {
         if(o.fused_csv)scan_csv<N>(chunk,consume);
         else Inputs::lines(chunk,[&](SV line){std::array<SV,N> fields;if(csv(line,fields))consume(fields);});
     }
-    int64_t parse_time(SV s)const{return o.fast_time?strict_time.parse(s):timestamp(s);}
+    int64_t parse_time(SV s)const{return o.fast_time?strict_time.parse(s,o.cache_utc_days):timestamp(s);}
     static unsigned classify_event(SV type) {
         if(type.size()==4) {
             uint32_t word;

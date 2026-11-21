@@ -84,7 +84,7 @@ int main(){try{
         require(key.view(buffer)==large,"large IDs retain complete mapped field");
     }
     {
-        StrictTimeParser parser;parser.init(timestamp("2028-02-20T00:00:00Z"),timestamp("2028-03-05T00:00:00Z"));
+        StrictTimeParser parser;parser.init(timestamp("2028-02-20T00:00:00Z"),timestamp("2028-03-05T00:00:00Z"),true);
         for(size_t i=0;i<300000;++i) {
             char value[48];
             unsigned y=i%3?2027+rng()%3:rng()%10000,m=rng()%15,d=rng()%34,h=rng()%26,mi=rng()%63,sec=rng()%63;
@@ -93,10 +93,19 @@ int main(){try{
             std::string input=value;
             if(i%4==0)input[rng()%input.size()]=char(rng()%256);
             require(parser.parse(input)==timestamp(input),"strict cached ISO parser equals general parser");
+            require(parser.parse(input,true)==timestamp(input),"packed UTC parser equals general parser");
             std::string epoch=std::to_string(rng()&INT64_MAX);
             if(i%3==0)epoch.insert(0,rng()%25,'0');
             if(i%5==0)epoch[rng()%epoch.size()]=char(rng()%256);
             require(parser.parse(epoch)==timestamp(epoch),"SWAR epoch parser equals general parser");
+        }
+        const std::string leap_day="2028-02-29T23:59:59Z";
+        for(size_t position=0;position<leap_day.size();++position) {
+            for(unsigned byte=0;byte<256;++byte) {
+                auto input=leap_day;
+                input[position]=char(byte);
+                require(parser.parse(input,true)==timestamp(input),"all bytes of cached UTC leap day");
+            }
         }
         for(size_t i=0;i<100000;++i) {
             char eight[9];unsigned n=rng()%100000000;

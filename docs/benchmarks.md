@@ -409,3 +409,10 @@ count of each input. The vectors still grow for skewed partitions. Two
 five-pair runs measured **1.387 vs 1.428 seconds** and **1.022 vs 1.042
 seconds**, with approximately 170 MiB higher peak RSS. All 20M outputs
 matched the reference. Use `--grow-routes` to compare growth on demand.
+
+The timestamp parser caches exact UTC dates around the input window and
+validates all eight time-of-day bytes together. Uncached dates and other
+timestamp formats use the existing parser. Two five-pair runs measured
+**1.361 vs 1.403 seconds** and **1.016 vs 1.021 seconds**. Event parsing used
+about 6% less CPU in the first batch, and every full 20M output matched.
+Use `--no-cache-utc-days` to compare the previous parser.

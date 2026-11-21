@@ -6,9 +6,32 @@ namespace shop {
 // retain the original general parser. No dataset IDs or seeds are assumed.
 struct StrictTimeParser {
     static constexpr int64_t BAD=INT64_MIN;
+    struct UtcDay {uint64_t prefix=0;int64_t milliseconds=0;uint16_t day=0;};
     int first_year=0,last_year=-1;
     std::vector<int64_t> calendar;
-    void init(int64_t start,int64_t end) {
+    std::array<UtcDay,64> utc_days{};
+    static size_t day_index(const char* day) {
+        return (static_cast<unsigned char>(day[0])&3)*16+(static_cast<unsigned char>(day[1])&15);
+    }
+    void cache_utc_days(int64_t start,int64_t end) {
+        using namespace std::chrono;
+        const auto first=std::max(dayof(start-WEEK),civil(0,1,1));
+        const auto last=std::min({first+40,dayof(end-1)+5,civil(9999,12,31)});
+        for(auto day=first;day<=last;++day) {
+            year_month_day date{sys_days{days{day}}};
+            int y=int(date.year());
+            if(y<0||y>9999)continue;
+            int m=unsigned(date.month()),d=unsigned(date.day());
+            const std::array<char,8> prefix{char('0'+y/1000),char('0'+y/100%10),char('0'+y/10%10),char('0'+y%10),
+                                           '-',char('0'+m/10),char('0'+m%10),'-'};
+            const std::array<char,2> digits{char('0'+d/10),char('0'+d%10)};
+            // Dates with the same day of month share this slot. The full
+            // prefix check sends any displaced date to the calendar parser.
+            utc_days[day_index(digits.data())]={std::bit_cast<uint64_t>(prefix),day*DAY,std::bit_cast<uint16_t>(digits)};
+        }
+    }
+    void init(int64_t start,int64_t end,bool cache_days=false) {
+        if(cache_days)cache_utc_days(start,end);
         auto year=[](int64_t ts){return int(std::chrono::year_month_day{std::chrono::sys_days{std::chrono::days{dayof(ts)}}}.year());};
         first_year=year(start)-1;last_year=year(end-1)+1;
         calendar.assign(size_t(last_year-first_year+1)*512,BAD);
@@ -49,8 +72,34 @@ struct StrictTimeParser {
         v=(v&0x00ff00ff00ff00ffULL)*6553601>>16;
         return uint32_t((v&0x0000ffff0000ffffULL)*42949672960001ULL>>32);
     }
-    int64_t parse(SV s)const {
+    int64_t cached_utc(const char* p)const {
+        const auto& cached=utc_days[day_index(p+8)];
+        uint64_t prefix;
+        uint16_t day;
+        std::memcpy(&prefix,p,8);
+        std::memcpy(&day,p+8,2);
+        if(prefix!=cached.prefix||day!=cached.day||p[10]!='T'||p[19]!='Z')return BAD;
+        if constexpr(std::endian::native!=std::endian::little)return BAD;
+        uint64_t time;
+        std::memcpy(&time,p+11,8);
+        constexpr auto low=std::bit_cast<uint64_t>(std::array<char,8>{'0','0',':','0','0',':','0','0'});
+        constexpr auto high=std::bit_cast<uint64_t>(std::array<char,8>{'2','9',':','5','9',':','5','9'});
+        constexpr uint64_t high_bits=0x8080808080808080ULL;
+        // A valid lower byte produces no carry or borrow. The first invalid
+        // byte must therefore set a high bit, even for non-ASCII inputs.
+        if(((time-low)|(time+(0x7f7f7f7f7f7f7f7fULL-high)))&high_bits)return -1;
+        const unsigned hours=(time&15)*10+(time>>8&15);
+        if(hours>23)return -1;
+        const unsigned minutes=(time>>24&15)*10+(time>>32&15);
+        const unsigned seconds=(time>>48&15)*10+(time>>56&15);
+        return cached.milliseconds+int64_t(hours*3600+minutes*60+seconds)*1000;
+    }
+    int64_t parse(SV s,bool cache_days=false)const {
         const char* p=s.data();
+        if(cache_days&&s.size()==20) {
+            auto result=cached_utc(p);
+            if(result!=BAD)return result;
+        }
         if((s.size()==20||s.size()==25)&&p[4]=='-') {
             if(p[7]!='-'||p[10]!='T'||p[13]!=':'||p[16]!=':'||!first_date_digits(p))return -1;
             int y=pair(p)*100+pair(p+2),m=pair(p+5),d=pair(p+8),h=pair(p+11),mi=pair(p+14),sec=checked_pair(p+17);
