@@ -1,0 +1,22 @@
+name: Exact outputs and scorer container
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native unit tests and official fixtures
+        run: make -j2 test
+      - name: Generate the official dev set and download expected answers
+        run: |
+          make dev CARGO=cargo
+          sh scripts/fetch-dev-answer.sh
+      - name: Build the submission image
+        run: make docker
+      - name: Run with scorer restrictions and compare exact outputs
+        run: |
+          sh scripts/docker_run.sh data/dev out-container
+          build/check compare out-container data/dev-answer

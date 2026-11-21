@@ -16,3 +16,9 @@ interface are in `native/sort.hpp`. That adapter is project code.
 The pipeline reuses these components directly, without embedding the database
 engine. DuckDB describes their composition here:
 https://duckdb.org/2025/09/24/sorting-again
+
+`native/hash.hpp` additionally adapts `HashBytes` and `MurmurHash64` from the same
+DuckDB version's `src/common/types/hash.cpp` and
+`src/include/duckdb/common/types/hash.hpp`, using standard C++ types and safe
+unaligned loads. The adapted file is marked as such. This uses the DuckDB MIT
+license; upstream credits the hash seed to Martin Ankerl (MIT, 2018-2021).

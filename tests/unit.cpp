@@ -1,5 +1,6 @@
 #include "../native/core.hpp"
 #include "../native/sort.hpp"
+#include "../native/flat_map.hpp"
 #include <cstdlib>
 #include <random>
 using namespace shop;
@@ -23,6 +24,12 @@ int main(){try{
     require(!digits("10000001",n,10000000)&&!digits("٢٥٠",n),"price bounds and ASCII");
     People p;p.join("z","y");p.join("y","x");p.join("A","z");p.join("z","z");p.join("é","A");p.finish();
     require(p.person("x")=="A"&&p.person("é")=="A"&&p.person("independent")=="independent","union find minimum");
+    FlatMap<uint32_t> map;
+    std::vector<std::string> keys;keys.reserve(10000);
+    for(size_t i=0;i<10000;++i)keys.push_back("exact key "+std::to_string(i));
+    for(size_t i=0;i<keys.size();++i)require(map.try_emplace(keys[i],i).second,"flat insert");
+    for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
+    require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
     std::mt19937_64 rng(938151);
     for(uint64_t width:{uint64_t(14*DAY),uint64_t(UINT32_MAX)+1,uint64_t(500*DAY)}) {
         std::vector<CompactEvent> rows;

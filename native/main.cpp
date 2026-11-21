@@ -19,6 +19,7 @@ struct Options {
     int threads=8,shards=256;
     bool baseline=false;
     bool compact=true;
+    bool flat_links=false;
     std::string dedup="hash";
     std::string sorter="duckdb";
 };
@@ -33,6 +34,7 @@ Options options(int argc,char** argv) {
         if(arg=="--baseline")o.baseline=true;
         else if(arg=="--compact")o.compact=true;
         else if(arg=="--no-compact")o.compact=false;
+        else if(arg=="--flat-links")o.flat_links=true;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup"&&i+1<argc)o.dedup=argv[++i];
@@ -43,7 +45,7 @@ Options options(int argc,char** argv) {
         else if(positional==2)o.out=arg;
         else throw std::runtime_error("too many paths");
     }
-    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.sorter="std";}
+    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.sorter="std";}
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat")throw std::runtime_error("dedup must be sort, hash, or flat");
     if(o.sorter!="std"&&o.sorter!="duckdb")throw std::runtime_error("sorter must be std or duckdb");
@@ -53,6 +55,7 @@ struct Pipeline {
     Options o;
     Inputs in;
     People people;
+    FlatMap<uint32_t> person_lookup;
     Dict<uint32_t> products,campaigns,category_index;
     std::vector<SV> categories={"unknown"},campaign_names={"organic"},channels={"organic"};
     int64_t start,end;
@@ -93,6 +96,12 @@ struct Pipeline {
             std::array<SV,2> f;if(csv(line,f)&&!f[0].empty()&&!f[1].empty())people.join(f[0],f[1]);
         });
         people.finish();
+        if(o.flat_links) {
+            person_lookup.reserve(people.index.size());
+            for(auto [name,root]:people.index)person_lookup.try_emplace(name,root);
+            Dict<uint32_t>().swap(people.index);
+            std::vector<uint32_t>().swap(people.parents);std::vector<uint32_t>().swap(people.sizes);
+        }
         for(auto p:files(o.data/"events"))in.add(p,in.events);
         for(auto p:files(o.data/"clicks"))in.add(p,in.clicks);
         fs::create_directories(o.out/"user_daily");fs::create_directories(o.out/"campaign_daily");
@@ -101,6 +110,10 @@ struct Pipeline {
     }
     static std::vector<fs::path> files_parquet(const fs::path& dir) {
         std::vector<fs::path> r;for(auto& p:fs::directory_iterator(dir))if(p.is_regular_file()&&p.path().extension()==".parquet")r.push_back(p.path());return r;
+    }
+    SV canonical(SV s)const {
+        if(!o.flat_links)return people.person(s);
+        auto it=person_lookup.find(s);return it==person_lookup.end()?s:people.names[it->second];
     }
     void parse_events() {
         parallel(in.events.size(),o.threads,[&](size_t i,int worker){
@@ -118,7 +131,7 @@ struct Pipeline {
                     if(valid){auto it=products.find(f[5]);if(it!=products.end())category=it->second;}
                 }
                 if(!valid)ts=-1;
-                raw[worker][shard(f[0])].push_back({f[0],people.person(f[1]),ts,ingest,uint32_t(price),category});
+                raw[worker][shard(f[0])].push_back({f[0],canonical(f[1]),ts,ingest,uint32_t(price),category});
             });
         });
     }
@@ -148,7 +161,7 @@ struct Pipeline {
                 std::array<SV,4> f;if(!csv(line,f)||f[0].empty()||f[1].empty())return;
                 auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
                 auto ts=timestamp(f[3]);if(ts<start-WEEK||ts>=end)return;
-                auto p=people.person(f[1]);clicks[worker][shard(p)].push_back({p,f[0],ts,it->second});
+                auto p=canonical(f[1]);clicks[worker][shard(p)].push_back({p,f[0],ts,it->second});
             });
         });
         // Identical duplicate clicks need no materialized dedup: they cannot

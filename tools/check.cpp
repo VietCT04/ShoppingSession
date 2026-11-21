@@ -17,6 +17,16 @@ struct Database {
     }
 };
 std::string quote(std::string s){std::string r="'";for(char c:s){r+=c;if(c=='\'')r+=c;}return r+"'";}
+std::string json_string(SV s) {
+    std::string r="\"";
+    const char* hex="0123456789abcdef";
+    for(unsigned char c:s) {
+        if(c=='"'||c=='\\'){r+='\\';r+=c;}
+        else if(c<32){r+="\\u00";r+=hex[c>>4];r+=hex[c&15];}
+        else r+=c;
+    }
+    return r+'"';
+}
 std::string source(fs::path root,std::string table) {
     auto csv=root/(table+".csv");
     if(fs::exists(csv)) {
@@ -67,13 +77,14 @@ int main(int argc,char** argv) {
         else if(mode=="fixtures") {
             fs::create_directories("build/fixture-output");int cases=0;
             std::vector<fs::path> paths;for(auto& p:fs::directory_iterator("fixtures"))if(p.is_directory())paths.push_back(p.path());std::sort(paths.begin(),paths.end());
-            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb"}) {
+            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen"}) {
                 std::vector<std::string> args={argc>2?argv[2]:"build/shopping",(p/"input").string(),"build/fixture-output"};
                 if(config=="baseline")args.push_back("--baseline");else {
                     args.push_back("--no-compact");args.push_back("--sorter");args.push_back("std");
                     args.push_back("--dedup");args.push_back(config.substr(0,config.find('-')));
                     if(config.find("compact")!=std::string::npos)args.push_back("--compact");
-                    if(config.ends_with("-duckdb")){args.push_back("--sorter");args.push_back("duckdb");}
+                    if(config.find("duckdb")!=std::string::npos){args.push_back("--sorter");args.push_back("duckdb");}
+                    if(config.ends_with("-frozen"))args.push_back("--flat-links");
                 }
                 run(args,"build/fixture.log");compare(db,"build/fixture-output",p/"expected");
                 std::cout<<"PASS "<<p.filename().string()<<" "<<config<<'\n';++cases;
@@ -97,6 +108,7 @@ int main(int argc,char** argv) {
             };
             configs.push_back({"duckdb-8-256",{"--threads","8","--shards","256","--dedup","hash","--sorter","duckdb"}});
             configs.push_back({"duckdb-compact-8-256",{"--threads","8","--shards","256","--dedup","hash","--sorter","duckdb","--compact"}});
+            configs.push_back({"duckdb-frozen-8-256",{"--threads","8","--shards","256","--dedup","hash","--sorter","duckdb","--compact","--flat-links"}});
             // SKIP_BASELINE is useful when timing large datasets against a
             // previously computed oracle. Correctness remains mandatory.
             if(std::getenv("SKIP_BASELINE"))configs.erase(configs.begin());
@@ -112,10 +124,8 @@ int main(int argc,char** argv) {
                     args.insert(args.begin()+3,{"--no-compact","--sorter","std"});
                     auto log=fs::path("benchmarks")/(config.name+"-"+std::to_string(i)+".log");
                     auto r=run(args,log);compare(db,out,argv[3]);times.push_back(r.seconds);
-                    // Values with filesystem paths are omitted to keep valid JSON
-                    // regardless of unusual path characters. Dataset metadata is
-                    // captured by the caller in the benchmark report.
-                    results<<"{\"config\":\""<<config.name<<"\",\"repeat\":"<<i<<",\"seconds\":"<<std::setprecision(9)<<r.seconds<<",\"peak_rss_kib\":"<<r.rss<<",\"correct\":true}\n";results.flush();
+                    auto timestamp=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    results<<"{\"config\":"<<json_string(config.name)<<",\"dataset\":"<<json_string(argv[2])<<",\"timestamp\":"<<timestamp<<",\"repeat\":"<<i<<",\"seconds\":"<<std::setprecision(9)<<r.seconds<<",\"peak_rss_kib\":"<<r.rss<<",\"correct\":true}\n";results.flush();
                     std::cout<<config.name<<" "<<i<<" "<<r.seconds<<"s "<<r.rss/1024.0<<" MiB MATCH\n"<<std::flush;
                 }
                 std::sort(times.begin(),times.end());std::cout<<"MEDIAN "<<config.name<<" "<<times[times.size()/2]<<"s\n";

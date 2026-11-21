@@ -8,17 +8,18 @@ EVENTS ?= 1000000
 CLICKS ?= 250000
 SEED ?= 1
 CARGO ?= $(HOME)/.cargo/bin/cargo
+NATIVE_HEADERS := $(wildcard native/*.hpp)
 
 .PHONY: all baseline run fixtures check-dev dev benchmark clean docker test
 all: $(BUILD)/shopping
-$(BUILD)/check: tools/check.cpp native/core.hpp | $(BUILD)
+$(BUILD)/check: tools/check.cpp $(NATIVE_HEADERS) | $(BUILD)
 	sh scripts/bootstrap-validator.sh
 	$(CXX) $(CXXFLAGS) -Ibuild/vendor tools/check.cpp -Lbuild/vendor -lduckdb -Wl,-rpath,'$$ORIGIN/vendor' -o $@
 $(BUILD):
 	mkdir -p $@
-$(BUILD)/shopping: native/main.cpp native/core.hpp native/parquet.hpp native/flat_map.hpp native/sort.hpp $(wildcard third_party/duckdb_sort/*.h*) | $(BUILD)
+$(BUILD)/shopping: native/main.cpp $(NATIVE_HEADERS) $(wildcard third_party/duckdb_sort/*.h*) | $(BUILD)
 	$(CXX) $(CXXFLAGS) native/main.cpp -o $@
-$(BUILD)/unit: tests/unit.cpp native/core.hpp native/sort.hpp | $(BUILD)
+$(BUILD)/unit: tests/unit.cpp $(NATIVE_HEADERS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) tests/unit.cpp -o $@
 test: $(BUILD)/unit fixtures
 	$(BUILD)/unit

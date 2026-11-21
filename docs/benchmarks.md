@@ -29,11 +29,15 @@ Every timed output exactly matches the single-thread reference output.
 | std::unordered_map dedup, 64 partitions, 4 threads | 16.766 |
 | Flat-table dedup + compact IDs, 64 partitions, 8 threads | 16.868 |
 | DuckDB Ska Sort + compact IDs + hash dedup, 256 partitions | **12.462** |
+| Above + ported DuckDB HashBytes | **12.429** |
 
 The new best's three runs were 13.295, 12.462, and 12.055 seconds, all exact
 matches. This configuration is the production default. The improvement over
 12.789 seconds is small relative to local timing variation and needs confirmation
 on the official scorer; it is a verified local record, not a leaderboard result.
+
+The HashBytes candidate ran in 12.429, 12.104, and 13.742 seconds. Its median
+improvement is within measurement noise. Exact outputs and all fixtures passed.
 
 The 20M baseline took 60.98 seconds in one exploratory run, partly overlapping
 another process; it is not a controlled speedup denominator. The parallel

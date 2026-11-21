@@ -1,4 +1,5 @@
 #pragma once
+#include "hash.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -29,10 +30,14 @@ constexpr int64_t DAY=86400000, WEEK=7*DAY, GAP=1800000;
 struct Hash {
     size_t operator()(SV s) const noexcept {
         // Full bytes determine identity; hashes only select buckets.
+#ifndef SHOP_LEGACY_HASH
+        return duckdb_hash(s);
+#else
         uint64_t h=0xa0761d6478bd642fULL;
         for(unsigned char c:s) h=(h^c)*0x100000001b3ULL;
         h^=h>>32; h*=0xd6e8feb86659fd93ULL; h^=h>>32;
         return h;
+#endif
     }
 };
 template<class V> using Dict=std::unordered_map<SV,V,Hash>;
