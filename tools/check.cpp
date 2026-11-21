@@ -154,6 +154,8 @@ int main(int argc,char** argv) {
             const auto tier_control=configs.back().flags;
             configs.push_back({"tag-links",tier_control});
             configs.back().flags.push_back("--tag-links");
+            configs.push_back({"sparse-duplicates",configs.back().flags});
+            configs.back().flags.push_back("--sparse-duplicates");
             configs.push_back({"heavy-shards",tier_control});
             configs.back().flags.push_back("--heavy-shards-first");
             configs.push_back({"ingest-1024",ingest_control});

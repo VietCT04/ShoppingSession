@@ -88,6 +88,7 @@ struct Options {
     bool direct_dedup=false,direct_encoding=true;
     bool overlap_links=true;
     bool tag_links=true,heavy_shards_first=false;
+    bool sparse_duplicates=false;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -127,6 +128,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--tag-links")o.tag_links=true;
         else if(arg=="--no-tag-links")o.tag_links=false;
         else if(arg=="--heavy-shards-first")o.heavy_shards_first=true;
+        else if(arg=="--sparse-duplicates")o.sparse_duplicates=true;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -332,6 +334,10 @@ struct Pipeline {
         });
     }
     template<class Emit> void dedup_rows(std::vector<Raw>& rows,Emit emit) {
+        if(o.sparse_duplicates&&o.dedup=="flat"&&rows.size()>=1024) {
+            dedup_sparse(rows,emit);
+            return;
+        }
         if(o.dedup=="dense") {
             ankerl::unordered_dense::map<Key,size_t,DenseKeyHash> winners;winners.reserve(rows.size());
             for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
@@ -348,6 +354,33 @@ struct Pipeline {
             std::sort(rows.begin(),rows.end(),[](const Raw& a,const Raw& b){return a.id!=b.id?a.id<b.id:a.ingest<b.ingest;});
             for(size_t i=0;i<rows.size();){emit(rows[i]);size_t j=i+1;while(j<rows.size()&&rows[j].id==rows[i].id)++j;i=j;}
         }
+    }
+    template<class Emit> static void dedup_sparse(const std::vector<Raw>& rows,Emit emit) {
+        // The bitmap can prove a hash tag occurs once. Shared tags always go
+        // through exact key comparison, including collisions of distinct IDs.
+        std::array<uint64_t,1024> seen{}, shared{};
+        std::vector<uint16_t> tags;
+        tags.reserve(rows.size());
+        for(const auto& event:rows) {
+            uint16_t tag=uint64_t(KeyHash{}(event.id))>>32;
+            tags.push_back(tag);
+            const uint64_t bit=uint64_t{1}<<(tag&63);
+            shared[tag>>6]|=seen[tag>>6]&bit;
+            seen[tag>>6]|=bit;
+        }
+        KeyFlatMap<size_t> winners;
+        winners.reserve(rows.size()/8);
+        for(size_t i=0;i<rows.size();++i) {
+            const auto tag=tags[i];
+            const auto& event=rows[i];
+            if(!(shared[tag>>6]&(uint64_t{1}<<(tag&63)))) {
+                emit(event);
+                continue;
+            }
+            auto [entry,inserted]=winners.try_emplace(event.id,i);
+            if(!inserted&&event.ingest<rows[entry->second].ingest)entry->second=i;
+        }
+        winners.each([&](const Key&,size_t row){emit(rows[row]);});
     }
     void parse_clicks() {
         parallel(in.clicks.size(),o.threads,[&](size_t i,int worker){
