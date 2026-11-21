@@ -77,7 +77,7 @@ int main(int argc,char** argv) {
         else if(mode=="fixtures") {
             fs::create_directories("build/fixture-output");int cases=0;
             std::vector<fs::path> paths;for(auto& p:fs::directory_iterator("fixtures"))if(p.is_directory())paths.push_back(p.path());std::sort(paths.begin(),paths.end());
-            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense"}) {
+            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense","dense-person-dense"}) {
                 std::vector<std::string> args={argc>2?argv[2]:"build/shopping",(p/"input").string(),"build/fixture-output"};
                 if(config=="baseline")args.push_back("--baseline");else {
                     args.push_back("--no-compact");args.push_back("--no-group-person");args.push_back("--no-dense-totals");args.push_back("--sorter");args.push_back("std");
@@ -117,6 +117,7 @@ int main(int argc,char** argv) {
             configs.push_back({"duckdb-flat-dense-8-256",{"--threads","8","--shards","256","--dedup","flat","--sorter","duckdb","--compact","--dense-totals"}});
             configs.push_back({"packed-8-256",{"--threads","8","--shards","256","--dedup","flat","--sorter","duckdb","--no-compact","--dense-totals"}});
             configs.push_back({"person-8-256",{"--threads","8","--shards","256","--dedup","flat","--sorter","duckdb","--group-person","--dense-totals"}});
+            configs.push_back({"person-dense-8-256",{"--threads","8","--shards","256","--dedup","dense","--sorter","duckdb","--group-person","--dense-totals"}});
             // SKIP_BASELINE is useful when timing large datasets against a
             // previously computed oracle. Correctness remains mandatory.
             if(std::getenv("SKIP_BASELINE"))configs.erase(configs.begin());

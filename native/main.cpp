@@ -3,6 +3,7 @@
 #include "flat_map.hpp"
 #include "sort.hpp"
 #include "id.hpp"
+#include "../third_party/unordered_dense/ankerl/unordered_dense.h"
 #include <cstdlib>
 #ifndef SHOP_VIEW_IDS
 #define SHOP_PACKED_IDS
@@ -18,6 +19,10 @@ SV text(SV s){return s;}
 #endif
 template<class V>using KeyDict=std::unordered_map<Key,V,KeyHash>;
 template<class V>using KeyFlatMap=FlatMap<V,Key,KeyHash>;
+struct DenseKeyHash {
+    using is_avalanching=void;
+    size_t operator()(const Key& key)const noexcept {auto h=KeyHash{}(key);return h^(h>>32);}
+};
 struct Raw {Key id,person;int64_t ts,ingest;uint32_t price,category;};
 struct Event {
     Key person;int64_t ts;uint32_t price,category;
@@ -93,7 +98,7 @@ Options options(int argc,char** argv) {
     }
     if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.sorter="std";}
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
-    if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat")throw std::runtime_error("dedup must be sort, hash, or flat");
+    if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat"&&o.dedup!="dense")throw std::runtime_error("dedup must be sort, hash, flat, or dense");
     if(o.sorter!="std"&&o.sorter!="duckdb")throw std::runtime_error("sorter must be std or duckdb");
     return o;
 }
@@ -207,7 +212,11 @@ struct Pipeline {
             std::vector<Raw> rows;rows.reserve(count);
             for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<Raw>().swap(w[s]);}
             auto emit=[&](const Raw& r){if(r.ts>=start)events[worker][shard(r.person)].push_back({r.person,r.ts,r.price,r.category});};
-            if(o.dedup=="flat") {
+            if(o.dedup=="dense") {
+                ankerl::unordered_dense::map<Key,size_t,DenseKeyHash> winners;winners.reserve(rows.size());
+                for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
+                for(auto [id,i]:winners)emit(rows[i]);
+            } else if(o.dedup=="flat") {
                 KeyFlatMap<size_t> winners;winners.reserve(rows.size());
                 for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
                 winners.each([&](Key,size_t i){emit(rows[i]);});

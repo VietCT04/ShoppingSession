@@ -44,6 +44,13 @@ the histogram/scatter and encoding passes add memory traffic. It is selected as
 the default; `--no-group-person` retains the preceding algorithm. All 396
 fixture/configuration checks and unit tests pass.
 
+Optional `ankerl::unordered_dense` 5.3.3 deduplication was tested separately on
+`perf/dense-dedup`. All 432 fixture/configuration checks and official dev answers
+pass. Its 20M runs took 6.612, 5.869, and 5.293 seconds (median 5.869), so it has
+not replaced the custom flat table. Dedup itself fell to 0.78 seconds in one run,
+but unrelated phases also varied substantially; close comparisons need
+alternating control/candidate runs on the same host.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
