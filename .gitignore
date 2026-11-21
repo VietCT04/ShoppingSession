@@ -1,0 +1,11 @@
+.venv/
+build/
+data/
+out/
+out-*/
+scratch/
+benchmarks/*.jsonl
+benchmarks/*.log
+tools/generator/target/
+*.pyc
+__pycache__/

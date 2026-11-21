@@ -1,0 +1,125 @@
+#include "duckdb.h"
+#include "../native/core.hpp"
+#include <cstdlib>
+#include <iomanip>
+#include <sys/resource.h>
+#include <sys/wait.h>
+using namespace shop;
+struct Database {
+    duckdb_database db=nullptr;
+    duckdb_connection con=nullptr;
+    Database(){if(duckdb_open(nullptr,&db)||duckdb_connect(db,&con))throw std::runtime_error("cannot open validator database");query("SET threads=4");query("SET memory_limit='1GB'");}
+    ~Database(){duckdb_disconnect(&con);duckdb_close(&db);}
+    int64_t query(const std::string& sql) {
+        duckdb_result r{};
+        if(duckdb_query(con,sql.c_str(),&r)) {std::string error=duckdb_result_error(&r);duckdb_destroy_result(&r);throw std::runtime_error(error+"\nSQL: "+sql);}
+        int64_t v=duckdb_row_count(&r)?duckdb_value_int64(&r,0,0):0;duckdb_destroy_result(&r);return v;
+    }
+};
+std::string quote(std::string s){std::string r="'";for(char c:s){r+=c;if(c=='\'')r+=c;}return r+"'";}
+std::string source(fs::path root,std::string table) {
+    auto csv=root/(table+".csv");
+    if(fs::exists(csv)) {
+        std::string types=table=="user_daily"?
+            "{'user_id':'VARCHAR','day':'DATE','sessions':'BIGINT','events':'BIGINT','revenue_cents':'BIGINT','top_category':'VARCHAR'}":
+            "{'campaign_id':'VARCHAR','channel':'VARCHAR','day':'DATE','sessions':'BIGINT','purchasing_sessions':'BIGINT','revenue_cents':'BIGINT','assisted_sessions':'BIGINT'}";
+        return "read_csv("+quote(csv.string())+", header=true, columns="+types+")";
+    }
+    return "read_parquet("+quote((root/table/"*.parquet").string())+")";
+}
+void compare(Database& db,const fs::path& a,const fs::path& b) {
+    for(std::string table:{"user_daily","campaign_daily"}) {
+        auto left=source(a,table),right=source(b,table);
+        std::string cols=table=="user_daily"?"user_id,day,sessions,events,revenue_cents,top_category":"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions";
+        // BY NAME and explicit projection reject missing columns; schema checks
+        // below also reject extras and a string or timestamp masquerading as DATE.
+        int64_t count=db.query("SELECT count(*) FROM (DESCRIBE SELECT * FROM "+left+")");
+        if(count!=(table=="user_daily"?6:7))throw std::runtime_error(table+": wrong column count");
+        int64_t date=db.query("SELECT count(*) FROM (DESCRIBE SELECT * FROM "+left+") WHERE column_name='day' AND column_type='DATE'");
+        if(date!=1)throw std::runtime_error(table+": day must be Parquet DATE");
+        int64_t different=db.query("SELECT count(*) FROM ((SELECT "+cols+" FROM "+left+" EXCEPT ALL SELECT "+cols+" FROM "+right+") UNION ALL (SELECT "+cols+" FROM "+right+" EXCEPT ALL SELECT "+cols+" FROM "+left+"))");
+        if(different)throw std::runtime_error(table+": "+std::to_string(different)+" differing rows");
+        auto key=table=="user_daily"?"user_id,day":"campaign_id,day";
+        if(db.query("SELECT count(*) FROM (SELECT "+std::string(key)+",count(*) n FROM "+left+" GROUP BY ALL HAVING n<>1)"))throw std::runtime_error(table+": duplicate keys");
+    }
+}
+struct Run {double seconds;long rss;};
+Run run(std::vector<std::string> args,const fs::path& log) {
+    auto start=std::chrono::steady_clock::now();
+    pid_t pid=fork();if(pid<0)throw std::runtime_error("fork failed");
+    if(pid==0) {
+        int fd=open(log.c_str(),O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd<0)_exit(126);
+        dup2(fd,STDERR_FILENO);close(fd);
+        std::vector<char*> argv;for(auto& a:args)argv.push_back(a.data());argv.push_back(nullptr);
+        execvp(argv[0],argv.data());_exit(127);
+    }
+    int status=0;struct rusage usage{};
+    if(wait4(pid,&status,0,&usage)<0)throw std::runtime_error("wait4 failed");
+    double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    if(!WIFEXITED(status)||WEXITSTATUS(status))throw std::runtime_error("pipeline failed; see "+log.string());
+    return {seconds,usage.ru_maxrss};
+}
+int main(int argc,char** argv) {
+    try {
+        if(argc<2)throw std::runtime_error("usage: check compare OUT EXPECTED | fixtures [BINARY] | bench DATA EXPECTED [REPEATS=3]");
+        std::string mode=argv[1];Database db;
+        if(mode=="compare"&&argc==4){compare(db,argv[2],argv[3]);std::cout<<"MATCH\n";}
+        else if(mode=="fixtures") {
+            fs::create_directories("build/fixture-output");int cases=0;
+            std::vector<fs::path> paths;for(auto& p:fs::directory_iterator("fixtures"))if(p.is_directory())paths.push_back(p.path());std::sort(paths.begin(),paths.end());
+            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb"}) {
+                std::vector<std::string> args={argc>2?argv[2]:"build/shopping",(p/"input").string(),"build/fixture-output"};
+                if(config=="baseline")args.push_back("--baseline");else {
+                    args.push_back("--no-compact");args.push_back("--sorter");args.push_back("std");
+                    args.push_back("--dedup");args.push_back(config.substr(0,config.find('-')));
+                    if(config.find("compact")!=std::string::npos)args.push_back("--compact");
+                    if(config.ends_with("-duckdb")){args.push_back("--sorter");args.push_back("duckdb");}
+                }
+                run(args,"build/fixture.log");compare(db,"build/fixture-output",p/"expected");
+                std::cout<<"PASS "<<p.filename().string()<<" "<<config<<'\n';++cases;
+            }
+            std::cout<<cases<<" fixture/config checks passed\n";
+        } else if(mode=="bench"&&argc>=4) {
+            int repeats=argc>4?std::stoi(argv[4]):3;
+            if(repeats<1)throw std::runtime_error("repeats must be positive");
+            fs::create_directories("benchmarks");
+            fs::path out="build/bench-output";
+            struct Config{std::string name;std::vector<std::string> flags;};
+            std::vector<Config> configs={
+                {"baseline",{"--baseline"}},
+                {"sort-8-64",{"--threads","8","--shards","64","--dedup","sort"}},
+                {"hash-8-64",{"--threads","8","--shards","64","--dedup","hash"}},
+                {"hash-8-256",{"--threads","8","--shards","256","--dedup","hash"}},
+                {"hash-4-64",{"--threads","4","--shards","64","--dedup","hash"}},
+                {"flat-8-64",{"--threads","8","--shards","64","--dedup","flat"}},
+                {"flat-compact-8-64",{"--threads","8","--shards","64","--dedup","flat","--compact"}},
+                {"flat-compact-8-256",{"--threads","8","--shards","256","--dedup","flat","--compact"}}
+            };
+            configs.push_back({"duckdb-8-256",{"--threads","8","--shards","256","--dedup","hash","--sorter","duckdb"}});
+            configs.push_back({"duckdb-compact-8-256",{"--threads","8","--shards","256","--dedup","hash","--sorter","duckdb","--compact"}});
+            // SKIP_BASELINE is useful when timing large datasets against a
+            // previously computed oracle. Correctness remains mandatory.
+            if(std::getenv("SKIP_BASELINE"))configs.erase(configs.begin());
+            if(auto filter=std::getenv("CONFIG"))configs.erase(std::remove_if(configs.begin(),configs.end(),[&](const auto& c){return c.name!=filter;}),configs.end());
+            if(configs.empty())throw std::runtime_error("CONFIG did not match a benchmark configuration");
+            std::ofstream results("benchmarks/runs.jsonl",std::ios::app);
+            for(auto config:configs) {
+                std::vector<double> times;
+                for(int i=0;i<repeats;++i) {
+                    std::vector<std::string> args={"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
+                    // Matrix entries start from fixed defaults rather than the
+                    // tuned production defaults. Explicit flags override these.
+                    args.insert(args.begin()+3,{"--no-compact","--sorter","std"});
+                    auto log=fs::path("benchmarks")/(config.name+"-"+std::to_string(i)+".log");
+                    auto r=run(args,log);compare(db,out,argv[3]);times.push_back(r.seconds);
+                    // Values with filesystem paths are omitted to keep valid JSON
+                    // regardless of unusual path characters. Dataset metadata is
+                    // captured by the caller in the benchmark report.
+                    results<<"{\"config\":\""<<config.name<<"\",\"repeat\":"<<i<<",\"seconds\":"<<std::setprecision(9)<<r.seconds<<",\"peak_rss_kib\":"<<r.rss<<",\"correct\":true}\n";results.flush();
+                    std::cout<<config.name<<" "<<i<<" "<<r.seconds<<"s "<<r.rss/1024.0<<" MiB MATCH\n"<<std::flush;
+                }
+                std::sort(times.begin(),times.end());std::cout<<"MEDIAN "<<config.name<<" "<<times[times.size()/2]<<"s\n";
+            }
+        } else throw std::runtime_error("invalid arguments");
+    }catch(const std::exception& e){std::cerr<<"check: "<<e.what()<<'\n';return 1;}
+}
