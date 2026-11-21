@@ -346,3 +346,10 @@ The compact-range build set a new local 20M median of **1.204 seconds** with
 GCC profile-guided optimization. The ordinary build measured **1.276 seconds**
 in the same five-pair batch on eight pinned workers. Outputs matched exactly
 in all ten runs. Profile training used the separate official 1M dev input.
+
+Linked-user aggregation uses a specialized array path when campaign and
+category arrays are available. It computes the base of a day's campaign
+totals once per person-day and indexes sessions and assists directly into
+that row. The five-pair median improved from **1.591 to 1.562 seconds** on
+the compact layout. Each run matched the full 20M reference. Use
+`--generic-aggregation` to compare the other aggregation path.

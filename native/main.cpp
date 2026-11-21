@@ -131,6 +131,7 @@ struct Options {
     bool batch_link_probes=true;
     bool narrow_count_columns=true;
     bool redirect_linked_groups=true;
+    bool specialize_aggregation=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -191,6 +192,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--wide-count-columns")o.narrow_count_columns=false;
         else if(arg=="--redirect-linked-groups")o.redirect_linked_groups=true;
         else if(arg=="--no-redirect-linked-groups")o.redirect_linked_groups=false;
+        else if(arg=="--specialize-aggregation")o.specialize_aggregation=true;
+        else if(arg=="--generic-aggregation")o.specialize_aggregation=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -757,7 +760,7 @@ struct Pipeline {
             for(const auto& group:groups)event_count+=group.events.size();
             if(groups.size()>1)duckdb_pdqsort::pdqsort(groups.begin(),groups.end(),[](auto& a,auto& b){return a.name<b.name;});
             profiles[worker].sort+=elapsed(before);
-            aggregate_users(s,worker,event_count,[&](auto consume) {
+            auto enumerate=[&](auto consume) {
                 std::vector<LinkedEvent> merged_events;
                 std::vector<LinkedClick> merged_clicks;
                 for(size_t i=0;i<groups.size();) {
@@ -780,7 +783,10 @@ struct Pipeline {
                     }
                     i=finish;
                 }
-            });
+            };
+            if(o.specialize_aggregation&&o.array_active&&o.array_categories&&o.dense_totals)
+                aggregate_users<true>(s,worker,event_count,enumerate);
+            else aggregate_users(s,worker,event_count,enumerate);
         });
     }
     template<class T,class Less>void sort_group(T* begin,T* end,Less less) {
@@ -839,34 +845,48 @@ struct Pipeline {
                 }
             });
     }
-    template<class Enumerate>void aggregate_users(size_t s,int worker,size_t event_count,Enumerate enumerate) {
+    template<bool Arrays=false,class Enumerate>void aggregate_users(size_t s,int worker,size_t event_count,Enumerate enumerate) {
             auto before=Clock::now();
             using parquet::Column;
             const int count_type=o.narrow_count_columns&&event_count<=INT32_MAX?1:2;
             std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",count_type},{"events",count_type},{"revenue_cents",2},{"top_category",6,true}};
-            CampaignWindow campaign_window(o.array_active?campaign_names.size():0);
-            CategoryRevenue category_revenue(o.array_categories?categories.size():0);
+            CampaignWindow campaign_window((Arrays||o.array_active)?campaign_names.size():0);
+            CategoryRevenue category_revenue((Arrays||o.array_categories)?categories.size():0);
             enumerate([&](Key person_name,auto ev,auto cl,int64_t time_base,int64_t click_base) {
                 ShortId::Buffer decoded_name;
                 SV person=text(person_name,decoded_name);
                 size_t hi=0,lo=0;
-                std::unordered_map<uint32_t,size_t> active;
+                struct Unused {};
+                std::conditional_t<Arrays,Unused,std::unordered_map<uint32_t,size_t>> active;
                 campaign_window.clear();
                 int64_t day=-1,ns=0,ne=0,nr=0;
-                std::unordered_map<uint32_t,int64_t> cat_revenue;
+                std::conditional_t<Arrays,Unused,std::unordered_map<uint32_t,int64_t>> cat_revenue;
+                Aggregate* day_totals=nullptr;
+                auto totals_for=[&](uint32_t campaign)->Aggregate& {
+                    if constexpr(Arrays)return day_totals[campaign];
+                    else return total(worker,day,campaign);
+                };
                 auto flush=[&]{
                     if(!ns)return;
                     cols[0].text(person);cols[1].number(day);cols[2].number(ns);cols[3].number(ne);cols[4].number(nr);
-                    if(o.array_categories) {
+                    if(Arrays||o.array_categories) {
                         if(category_revenue.present.empty())cols[5].null();
                         else cols[5].text(categories[category_revenue.top(categories)]);
-                    } else if(cat_revenue.empty())cols[5].null();
-                    else {uint32_t top=0;int64_t amount=-1;for(auto [c,r]:cat_revenue)if(r>amount||(r==amount&&categories[c]<categories[top])){top=c;amount=r;}cols[5].text(categories[top]);}
-                    ns=ne=nr=0;cat_revenue.clear();category_revenue.clear();
+                    } else if constexpr(!Arrays) {
+                        if(cat_revenue.empty())cols[5].null();
+                        else {uint32_t top=0;int64_t amount=-1;for(auto [c,r]:cat_revenue)if(r>amount||(r==amount&&categories[c]<categories[top])){top=c;amount=r;}cols[5].text(categories[top]);}
+                    }
+                    ns=ne=nr=0;
+                    if constexpr(!Arrays)cat_revenue.clear();
+                    category_revenue.clear();
                 };
                 for(size_t i=0;i<ev.size();) {
                     const int64_t st=time_base+ev[i].ts,sd=dayof(st);
-                    if(sd!=day){flush();day=sd;}
+                    if(sd!=day) {
+                        flush();day=sd;
+                        if constexpr(Arrays)
+                            day_totals=dense_totals[worker].data()+size_t(day-dayof(start))*campaign_names.size();
+                    }
                     size_t j=i+1;while(j<ev.size()&&ev[j].ts-ev[j-1].ts<=GAP)++j;
                     int64_t revenue=0;
                     for(size_t k=i;k<j;++k) {
@@ -880,29 +900,29 @@ struct Pipeline {
                         }
                         if(!price)continue;
                         revenue+=price;
-                        if(o.array_categories)category_revenue.add(category,price);
-                        else cat_revenue[category]+=price;
+                        if(Arrays||o.array_categories)category_revenue.add(category,price);
+                        else if constexpr(!Arrays)cat_revenue[category]+=price;
                     }
                     ++ns;ne+=j-i;nr+=revenue;
                     uint32_t credited=0;
                     const int64_t click_at=st-click_base;
-                    if(o.baseline) {
+                    if(!Arrays&&o.baseline) {
                         // Intentionally simple oracle: rescan clicks per session.
                         std::unordered_map<uint32_t,bool> assisted;
                         for(size_t k=0;k<cl.size();++k)if(cl[k].ts<=click_at&&cl[k].ts>=click_at-WEEK){credited=cl[k].campaign;assisted[credited]=true;}
-                        for(auto [cam,unused]:assisted)++total(worker,sd,cam).assisted;
-                    } else if(o.array_active) {
+                        for(auto [cam,unused]:assisted)++totals_for(cam).assisted;
+                    } else if(Arrays||o.array_active) {
                         while(hi<cl.size()&&cl[hi].ts<=click_at){campaign_window.add(cl[hi].campaign);++hi;}
                         while(lo<hi&&cl[lo].ts<click_at-WEEK){campaign_window.remove(cl[lo].campaign);++lo;}
                         if(hi>lo)credited=cl[hi-1].campaign;
-                        for(auto cam:campaign_window.present)++total(worker,sd,cam).assisted;
-                    } else {
+                        for(auto cam:campaign_window.present)++totals_for(cam).assisted;
+                    } else if constexpr(!Arrays) {
                         while(hi<cl.size()&&cl[hi].ts<=click_at){++active[cl[hi].campaign];++hi;}
                         while(lo<hi&&cl[lo].ts<click_at-WEEK){auto it=active.find(cl[lo].campaign);if(!--it->second)active.erase(it);++lo;}
                         if(hi>lo)credited=cl[hi-1].campaign;
-                        for(auto [cam,count]:active)++total(worker,sd,cam).assisted;
+                        for(auto [cam,count]:active)++totals_for(cam).assisted;
                     }
-                    auto& credited_total=total(worker,sd,credited);++credited_total.sessions;credited_total.purchasing+=revenue>0;credited_total.revenue+=revenue;
+                    auto& credited_total=totals_for(credited);++credited_total.sessions;credited_total.purchasing+=revenue>0;credited_total.revenue+=revenue;
                     i=j;
                 }
                 flush();
