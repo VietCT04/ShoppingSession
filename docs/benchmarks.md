@@ -381,3 +381,10 @@ With in-place marking, the ordinary and profile-guided builds reached exact
 five-run 20M medians of **1.109** and **1.106 seconds**, respectively. In a
 separate five-pair comparison of profile-guided builds, in-place marking
 improved the median from **1.395 to 1.344 seconds**. All outputs matched.
+
+Dedup records for compact linked-user inputs use 16 bytes on amd64. They
+store ingest time relative to the window and pack the worker, shard, and row
+position. A side array preserves full values when either field exceeds the
+compact range. Two five-pair runs measured **1.422 vs 1.478 seconds** and
+**1.078 vs 1.100 seconds**, with roughly 120 MiB lower peak RSS. Every 20M
+output matched the reference. Use `--wide-duplicate-locations` to compare.

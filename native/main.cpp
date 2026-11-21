@@ -7,6 +7,7 @@
 #include "csv_scan.hpp"
 #include "ingest_order.hpp"
 #include "ingest_arena.hpp"
+#include "location_codec.hpp"
 #include "sparse_state.hpp"
 #include "fast_time.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
@@ -46,6 +47,9 @@ struct DenseKeyHash {
 };
 struct Raw {Key id,person;int64_t ts,ingest;uint32_t price,category;};
 struct RawLocation {Key id;int64_t ingest;uint64_t location;};
+struct NarrowRawLocation {Key id;NarrowLocation location;};
+static_assert(sizeof(NarrowRawLocation)==sizeof(Key)+8);
+template<class R>constexpr bool is_location_record=std::is_same_v<R,RawLocation>||std::is_same_v<R,NarrowRawLocation>;
 struct CompactRaw {
     Key id,person;
     int64_t ingest;
@@ -136,6 +140,7 @@ struct Options {
     bool specialize_aggregation=true;
     bool raw_arena=true;
     bool mark_duplicate_events=true;
+    bool narrow_duplicate_locations=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -202,6 +207,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--vector-raw")o.raw_arena=false;
         else if(arg=="--mark-duplicate-events")o.mark_duplicate_events=true;
         else if(arg=="--copy-dedup-winners")o.mark_duplicate_events=false;
+        else if(arg=="--narrow-duplicate-locations")o.narrow_duplicate_locations=true;
+        else if(arg=="--wide-duplicate-locations")o.narrow_duplicate_locations=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -255,6 +262,7 @@ struct Pipeline {
     std::vector<CampaignTotals> totals;
     std::vector<std::vector<Aggregate>> dense_totals;
     std::vector<WorkProfile> profiles;
+    std::unique_ptr<LocationCodec> location_codec;
     explicit Pipeline(Options options):o(std::move(options)),
         events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
     using Clock=std::chrono::steady_clock;
@@ -416,16 +424,18 @@ struct Pipeline {
                 Key user_id(f[1]);
                 Key person=o.overlap_links?user_id:canonical(user_id);
                 size_t bucket=KeyHash{}(event_id)&(o.ingest_shards-1);
-                if constexpr(std::is_same_v<R,RawLocation>) {
-                    uint64_t location=0;
+                if constexpr(is_location_record<R>) {
+                    size_t destination=0,index=0;
                     if(valid) {
-                        size_t destination=shard(person);
+                        destination=shard(person);
                         auto& target=routed_events[worker][destination];
                         if(target.size()>=UINT32_MAX)throw std::runtime_error("too many events in one worker partition");
-                        location=(uint64_t(worker)<<48)|(uint64_t(destination)<<32)|(target.size()+1);
+                        index=target.size()+1;
                         target.push_back({person,uint32_t(ts-start),uint32_t(price)|(category<<24)});
                     }
-                    raw[worker][bucket].push_back({event_id,ingest,location});
+                    if constexpr(std::is_same_v<R,NarrowRawLocation>)
+                        raw[worker][bucket].push_back({event_id,location_codec->encode(ingest,worker,destination,index)});
+                    else raw[worker][bucket].push_back({event_id,ingest,LocationCodec::wide_position(worker,destination,index)});
                 } else if constexpr(std::is_same_v<R,CompactRaw>) {
                     uint32_t offset=valid?uint32_t(ts-start):CompactRaw::invalid;
                     uint32_t purchase_info=(uint32_t(price)&CompactRaw::price_mask)|(category<<24);
@@ -442,9 +452,16 @@ struct Pipeline {
     }
     // Records already reside in their user partitions. Only losing copies
     // need a write after the earliest-ingest comparison.
-    template<class Buffer>void mark_duplicate_locations(std::vector<std::vector<Buffer>>& raw) {
-        auto drop=[&](uint64_t location) {
+    template<class R,class Buffer>void mark_duplicate_locations(std::vector<std::vector<Buffer>>& raw) {
+        auto drop=[&](const R& row) {
+            uint64_t location;
+            if constexpr(std::is_same_v<R,NarrowRawLocation>)location=location_codec->decode(row.location);
+            else location=row.location;
             if(location)routed_events[location>>48][(location>>32)&65535][uint32_t(location)-1].offset=CompactRaw::invalid;
+        };
+        auto earlier=[&](const R& a,const R& b) {
+            if constexpr(std::is_same_v<R,NarrowRawLocation>)return location_codec->earlier(a.location,b.location);
+            else return a.ingest<b.ingest;
         };
         parallel(o.ingest_shards,o.threads,[&](size_t s,int) {
             size_t count=0;
@@ -452,7 +469,7 @@ struct Pipeline {
             if(!count)return;
             size_t partitions=o.dedup_shards/o.ingest_shards;
             unsigned shift=std::countr_zero(unsigned(o.ingest_shards));
-            std::vector<std::vector<RawLocation>> rows(partitions);
+            std::vector<std::vector<R>> rows(partitions);
             for(auto& part:rows)part.reserve(count/partitions+count/partitions/8+16);
             for(auto& worker:raw) {
                 for(const auto& row:worker[s])rows[event_shard(row.id)>>shift].push_back(row);
@@ -479,8 +496,8 @@ struct Pipeline {
                     auto [entry,added]=winners.try_emplace(row.id,i);
                     if(added)continue;
                     const auto& current=part[entry->second];
-                    if(row.ingest<current.ingest){drop(current.location);entry->second=i;}
-                    else drop(row.location);
+                    if(earlier(row,current)){drop(current);entry->second=i;}
+                    else drop(row);
                 }
             }
         });
@@ -1024,7 +1041,7 @@ struct Pipeline {
         auto process_raw=[&](auto& raw) {
             parse_events<R>(raw);
             timer.mark(o.overlap_links?"parse_events_and_links":"parse_events");
-            if constexpr(std::is_same_v<R,RawLocation>)mark_duplicate_locations(raw);
+            if constexpr(is_location_record<R>)mark_duplicate_locations<R>(raw);
             else dedup<R>(raw);
             timer.mark("dedup");
         };
@@ -1048,7 +1065,11 @@ struct Pipeline {
         o.mark_duplicate_events=o.mark_duplicate_events&&narrow_raw&&o.redirect_linked_groups&&
             o.sparse_duplicates&&o.dedup=="flat";
         if(narrow_raw) {
-            if(o.mark_duplicate_events)ingest_and_dedup<RawLocation>(t);
+            if(o.mark_duplicate_events&&o.narrow_duplicate_locations&&!o.ordered_ingest&&o.threads<=8) {
+                location_codec=std::make_unique<LocationCodec>(start-WEEK,o.threads,o.shards);
+                ingest_and_dedup<NarrowRawLocation>(t);
+                location_codec.reset();
+            } else if(o.mark_duplicate_events)ingest_and_dedup<RawLocation>(t);
             else ingest_and_dedup<CompactRaw>(t);
         } else {
             ingest_and_dedup<Raw>(t);

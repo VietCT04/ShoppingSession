@@ -8,12 +8,23 @@
 #include "../native/sparse_state.hpp"
 #include "../native/fast_time.hpp"
 #include "../native/ingest_arena.hpp"
+#include "../native/location_codec.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <random>
 using namespace shop;
 void require(bool v,const char* label){if(!v)throw std::runtime_error(label);}
 int main(){try{
+    {
+        LocationCodec codec(1000,8,256);
+        auto regular=codec.encode(2000,5,42,123);
+        auto earlier=codec.encode(-2000,5,42,0);
+        auto wide_row=codec.encode(3000,5,42,uint64_t{1}<<22);
+        require(codec.decode(regular)==LocationCodec::wide_position(5,42,123),"compact partition position");
+        require(!codec.decode(earlier)&&codec.earlier(earlier,regular),"invalid early copy keeps exact ingest order");
+        require(codec.decode(wide_row)==LocationCodec::wide_position(5,42,uint64_t{1}<<22)&&codec.earlier(regular,wide_row),
+                "wide partition position and timestamp fallback");
+    }
     {
         std::array<uint64_t,2> storage;
         ArenaBucket<uint64_t> bucket(storage.data(),storage.size());
