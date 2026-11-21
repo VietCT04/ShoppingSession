@@ -312,3 +312,9 @@ production defaults.
 A separate event-parser measurement took 0.153 seconds to extract fields,
 0.236 with timestamp parsing, 0.307 with ID encoding and hashing, and 0.470
 with partitioned record storage. These timings cover event ingest work only.
+
+The writer uses 32-bit Parquet count columns when the values fit, with a
+64-bit fallback. The same 20M output shrank from about 99 MB to 81 MB.
+Across five alternating pairs the medians were **1.766 seconds** with narrower
+counts and **1.801 seconds** with 64-bit counts. All outputs matched the
+reference. Use `--wide-count-columns` for the 64-bit layout.

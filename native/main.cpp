@@ -118,6 +118,7 @@ struct Options {
     bool packed_routing=true;
     bool fast_link_csv=true,reserve_links=true;
     bool batch_link_probes=true;
+    bool narrow_count_columns=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -174,6 +175,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--legacy-link-input"){o.fast_link_csv=false;o.reserve_links=false;}
         else if(arg=="--batch-link-probes")o.batch_link_probes=true;
         else if(arg=="--unbatched-link-probes")o.batch_link_probes=false;
+        else if(arg=="--narrow-count-columns")o.narrow_count_columns=true;
+        else if(arg=="--wide-count-columns")o.narrow_count_columns=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -195,6 +198,7 @@ Options options(int argc,char** argv) {
     if(o.baseline)o.overlap_links=false;
     if(o.baseline)o.tag_links=false;
     if(o.baseline)o.compact_raw=false;
+    if(o.baseline)o.narrow_count_columns=false;
     if(o.baseline){o.fast_link_csv=false;o.reserve_links=false;}
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup_shards<1||o.dedup_shards>16384||(o.dedup_shards&(o.dedup_shards-1)))throw std::runtime_error("dedup-shards must be a power of two in 1..16384");
@@ -716,7 +720,8 @@ struct Pipeline {
             }
             profiles[worker].sort+=elapsed(before);before=Clock::now();
             using parquet::Column;
-            std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",2},{"events",2},{"revenue_cents",2},{"top_category",6,true}};
+            const int count_type=o.narrow_count_columns&&ev.size()<=INT32_MAX?1:2;
+            std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",count_type},{"events",count_type},{"revenue_cents",2},{"top_category",6,true}};
             size_t cb=0;
             CampaignWindow campaign_window(o.array_active?campaign_names.size():0);
             CategoryRevenue category_revenue(o.array_categories?categories.size():0);
@@ -790,7 +795,13 @@ struct Pipeline {
         }
         for(auto& worker:totals)for(auto [key,t]:worker){auto& a=all[key];a.sessions+=t.sessions;a.purchasing+=t.purchasing;a.revenue+=t.revenue;a.assisted+=t.assisted;}
         using parquet::Column;
-        std::vector<Column> cols={{"campaign_id",6},{"channel",6},{"day",1,false,true},{"sessions",2},{"purchasing_sessions",2},{"revenue_cents",2},{"assisted_sessions",2}};
+        const bool counts_fit=o.narrow_count_columns&&std::all_of(all.begin(),all.end(),[](const auto& entry) {
+            const auto& t=entry.second;
+            return t.sessions<=INT32_MAX&&t.purchasing<=INT32_MAX&&t.assisted<=INT32_MAX;
+        });
+        const int count_type=counts_fit?1:2;
+        std::vector<Column> cols={{"campaign_id",6},{"channel",6},{"day",1,false,true},{"sessions",count_type},
+                                  {"purchasing_sessions",count_type},{"revenue_cents",2},{"assisted_sessions",count_type}};
         for(auto [key,t]:all){auto [day,cam]=key;cols[0].text(campaign_names[cam]);cols[1].text(channels[cam]);cols[2].number(day);cols[3].number(t.sessions);cols[4].number(t.purchasing);cols[5].number(t.revenue);cols[6].number(t.assisted);}
         parquet::write((o.out/"campaign_daily"/"part-0.parquet").string(),cols);
     }
