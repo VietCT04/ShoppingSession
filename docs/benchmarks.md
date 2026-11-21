@@ -335,3 +335,9 @@ A separate pinned five-pair run on the same production source measured a
 **1.334-second** median for the ordinary build and **1.544 seconds** for the
 profile-guided build. Both builds matched the full 20M reference on every
 run. Wall times within the batch varied from 1.287 to 1.690 seconds.
+
+The grouped ranges drop the redundant person code after partitioning and keep
+timestamps relative to the manifest window. On amd64, events now use 8 bytes
+and clicks use 16, down from 16 and 24. Across seven alternating pairs under
+sustained load, the median improved from **1.659 to 1.599 seconds**. The new
+layout was faster in all seven pairs, and every output matched the reference.

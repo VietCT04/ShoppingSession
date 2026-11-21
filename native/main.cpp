@@ -14,6 +14,7 @@
 #include "ips2ra.hpp"
 #endif
 #include <cstdlib>
+#include <functional>
 #ifndef SHOP_VIEW_IDS
 #define SHOP_PACKED_IDS
 #endif
@@ -78,6 +79,16 @@ struct CompactClick {
     Key id;int64_t ts;uint32_t campaign,person;
     bool operator<(const CompactClick& b)const{return ts!=b.ts?ts<b.ts:id>b.id;}
 };
+struct LinkedEvent {
+    uint32_t ts,purchase;
+    bool operator<(const LinkedEvent& other)const{return ts<other.ts;}
+};
+struct LinkedClick {
+    Key id;uint32_t ts,campaign;
+    bool operator<(const LinkedClick& other)const{return ts!=other.ts?ts<other.ts:id>other.id;}
+};
+static_assert(sizeof(LinkedEvent)==8);
+static_assert(sizeof(LinkedClick)==sizeof(Key)+8);
 struct TimeSortKey {
     bool requires_next_sort=false;
     static constexpr size_t ska_sort_width=8;
@@ -679,26 +690,29 @@ struct Pipeline {
         }
     }
     template<class T>struct Grouped {std::unique_ptr<T[]> data;size_t size;};
-    template<class T>static Grouped<T> group_records(std::vector<T>& input,std::vector<size_t>& counts) {
+    template<class T,class U=T,class Project=std::identity>
+    static Grouped<U> group_records(std::vector<T>& input,std::vector<size_t>& counts,Project project={}) {
         size_t sum=0;
         for(auto& count:counts){auto n=count;count=sum;sum+=n;}
         counts.push_back(sum);
         auto positions=counts;
         // Default-initialize trivial records: avoid an extra zero-fill pass.
-        std::unique_ptr<T[]> output(new T[sum]);
-        for(auto& row:input)output[positions[row.person]++]=row;
+        std::unique_ptr<U[]> output(new U[sum]);
+        for(auto& row:input)output[positions[row.person]++]=project(row);
         std::vector<T>().swap(input);
         return {std::move(output),sum};
     }
     void sessionize_linked_groups() {
+        struct EventInput {LinkedEvent event;uint32_t person;};
+        struct ClickInput {LinkedClick click;uint32_t person;};
         struct Source {
-            Grouped<RelativeEvent> events;
-            Grouped<CompactClick> clicks;
+            Grouped<LinkedEvent> events;
+            Grouped<LinkedClick> clicks;
         };
         struct Group {
             Key name;
-            std::span<RelativeEvent> events;
-            std::span<CompactClick> clicks;
+            std::span<LinkedEvent> events;
+            std::span<LinkedClick> clicks;
         };
         std::vector<Source> sources(o.shards);
         Workers<Group> grouped(o.threads,Buckets<Group>(o.shards));
@@ -712,21 +726,21 @@ struct Pipeline {
                 if(added){names.push_back(name);event_counts.push_back(0);click_counts.push_back(0);}
                 return entry->second;
             };
-            std::vector<RelativeEvent> ev;ev.reserve(event_bucket_size(s));
+            std::vector<EventInput> ev;ev.reserve(event_bucket_size(s));
             consume_bucket(routed_events,s,[&](const RoutedEvent& event) {
                 auto code=person_code(event.person);
                 ++event_counts[code];
-                ev.push_back({event.offset,event.purchase&CompactRaw::price_mask,event.purchase>>24,code});
+                ev.push_back({{event.offset,event.purchase},code});
             });
-            std::vector<CompactClick> cl;cl.reserve(click_bucket_size(s));
+            std::vector<ClickInput> cl;cl.reserve(click_bucket_size(s));
             consume_bucket(routed_clicks,s,[&](const RoutedClick& click) {
                 auto code=person_code(click.person);
                 ++click_counts[code];
-                cl.push_back({click.id,start-WEEK+click.offset,click.campaign,code});
+                cl.push_back({{click.id,click.offset,click.campaign},code});
             });
             auto& source=sources[s];
-            source.events=group_records(ev,event_counts);
-            source.clicks=group_records(cl,click_counts);
+            source.events=group_records<EventInput,LinkedEvent>(ev,event_counts,[](const EventInput& row){return row.event;});
+            source.clicks=group_records<ClickInput,LinkedClick>(cl,click_counts,[](const ClickInput& row){return row.click;});
             for(size_t i=0;i<names.size();++i) {
                 Key person=canonical(names[i]);
                 size_t destination=person==names[i]?s:shard(person);
@@ -744,8 +758,8 @@ struct Pipeline {
             if(groups.size()>1)duckdb_pdqsort::pdqsort(groups.begin(),groups.end(),[](auto& a,auto& b){return a.name<b.name;});
             profiles[worker].sort+=elapsed(before);
             aggregate_users(s,worker,event_count,[&](auto consume) {
-                std::vector<RelativeEvent> merged_events;
-                std::vector<CompactClick> merged_clicks;
+                std::vector<LinkedEvent> merged_events;
+                std::vector<LinkedClick> merged_clicks;
                 for(size_t i=0;i<groups.size();) {
                     size_t finish=i+1;
                     while(finish<groups.size()&&groups[finish].name==groups[i].name)++finish;
@@ -762,7 +776,7 @@ struct Pipeline {
                     if(!ev.empty()) {
                         sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
                         if(cl.size()>1)sort_group(cl.data(),cl.data()+cl.size(),[](auto& a,auto& b){return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;});
-                        consume(groups[i].name,ev,cl,start);
+                        consume(groups[i].name,ev,cl,start,start-WEEK);
                     }
                     i=finish;
                 }
@@ -770,6 +784,7 @@ struct Pipeline {
         });
     }
     template<class T,class Less>void sort_group(T* begin,T* end,Less less) {
+        constexpr bool is_click=std::is_same_v<T,CompactClick>||std::is_same_v<T,LinkedClick>;
         size_t n=end-begin;
         if(n<2)return;
         if(n<=24) {
@@ -780,12 +795,12 @@ struct Pipeline {
             if(o.group_sort=="ips4o")ips4o::sort(begin,end,less);
             else if(o.group_sort=="ips2ra") {
                 ips2ra::sort(begin,end,TimeSortKey{});
-                if constexpr(std::is_same_v<T,CompactClick>) {
+                if constexpr(is_click) {
                     for(T* b=begin;b<end;){T* e=b+1;while(e<end&&e->ts==b->ts)++e;if(e-b>1)duckdb_pdqsort::pdqsort(b,e,less);b=e;}
                 }
             } else
 #endif
-            duckdb_ska_sort::ska_sort(begin,end,TimeSortKey{std::is_same_v<T,CompactClick>});
+            duckdb_ska_sort::ska_sort(begin,end,TimeSortKey{is_click});
         }
     }
     template<bool pre_sorted=false,class E,class C,class Name> void process(size_t s,int worker,std::span<E> ev,std::span<C> cl,Name name,int64_t time_base=0) {
@@ -818,7 +833,7 @@ struct Pipeline {
                     while(cb<cl.size()&&cl[cb].person<person)++cb;
                     size_t ce=cb;
                     while(ce<cl.size()&&cl[ce].person==person)++ce;
-                    consume(name(person),ev.subspan(begin,finish-begin),cl.subspan(cb,ce-cb),time_base);
+                    consume(name(person),ev.subspan(begin,finish-begin),cl.subspan(cb,ce-cb),time_base,0);
                     cb=ce;
                     begin=finish;
                 }
@@ -831,7 +846,7 @@ struct Pipeline {
             std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",count_type},{"events",count_type},{"revenue_cents",2},{"top_category",6,true}};
             CampaignWindow campaign_window(o.array_active?campaign_names.size():0);
             CategoryRevenue category_revenue(o.array_categories?categories.size():0);
-            enumerate([&](Key person_name,auto ev,auto cl,int64_t time_base) {
+            enumerate([&](Key person_name,auto ev,auto cl,int64_t time_base,int64_t click_base) {
                 ShortId::Buffer decoded_name;
                 SV person=text(person_name,decoded_name);
                 size_t hi=0,lo=0;
@@ -854,26 +869,36 @@ struct Pipeline {
                     if(sd!=day){flush();day=sd;}
                     size_t j=i+1;while(j<ev.size()&&ev[j].ts-ev[j-1].ts<=GAP)++j;
                     int64_t revenue=0;
-                    for(size_t k=i;k<j;++k)if(ev[k].price){
-                        revenue+=ev[k].price;
-                        if(o.array_categories)category_revenue.add(ev[k].category,ev[k].price);
-                        else cat_revenue[ev[k].category]+=ev[k].price;
+                    for(size_t k=i;k<j;++k) {
+                        uint32_t price,category;
+                        if constexpr(std::is_same_v<typename decltype(ev)::element_type,LinkedEvent>) {
+                            price=ev[k].purchase&CompactRaw::price_mask;
+                            category=ev[k].purchase>>24;
+                        } else {
+                            price=ev[k].price;
+                            category=ev[k].category;
+                        }
+                        if(!price)continue;
+                        revenue+=price;
+                        if(o.array_categories)category_revenue.add(category,price);
+                        else cat_revenue[category]+=price;
                     }
                     ++ns;ne+=j-i;nr+=revenue;
                     uint32_t credited=0;
+                    const int64_t click_at=st-click_base;
                     if(o.baseline) {
                         // Intentionally simple oracle: rescan clicks per session.
                         std::unordered_map<uint32_t,bool> assisted;
-                        for(size_t k=0;k<cl.size();++k)if(cl[k].ts<=st&&cl[k].ts>=st-WEEK){credited=cl[k].campaign;assisted[credited]=true;}
+                        for(size_t k=0;k<cl.size();++k)if(cl[k].ts<=click_at&&cl[k].ts>=click_at-WEEK){credited=cl[k].campaign;assisted[credited]=true;}
                         for(auto [cam,unused]:assisted)++total(worker,sd,cam).assisted;
                     } else if(o.array_active) {
-                        while(hi<cl.size()&&cl[hi].ts<=st){campaign_window.add(cl[hi].campaign);++hi;}
-                        while(lo<hi&&cl[lo].ts<st-WEEK){campaign_window.remove(cl[lo].campaign);++lo;}
+                        while(hi<cl.size()&&cl[hi].ts<=click_at){campaign_window.add(cl[hi].campaign);++hi;}
+                        while(lo<hi&&cl[lo].ts<click_at-WEEK){campaign_window.remove(cl[lo].campaign);++lo;}
                         if(hi>lo)credited=cl[hi-1].campaign;
                         for(auto cam:campaign_window.present)++total(worker,sd,cam).assisted;
                     } else {
-                        while(hi<cl.size()&&cl[hi].ts<=st){++active[cl[hi].campaign];++hi;}
-                        while(lo<hi&&cl[lo].ts<st-WEEK){auto it=active.find(cl[lo].campaign);if(!--it->second)active.erase(it);++lo;}
+                        while(hi<cl.size()&&cl[hi].ts<=click_at){++active[cl[hi].campaign];++hi;}
+                        while(lo<hi&&cl[lo].ts<click_at-WEEK){auto it=active.find(cl[lo].campaign);if(!--it->second)active.erase(it);++lo;}
                         if(hi>lo)credited=cl[hi-1].campaign;
                         for(auto [cam,count]:active)++total(worker,sd,cam).assisted;
                     }
