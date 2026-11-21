@@ -149,6 +149,12 @@ from **3.712 s**. Every trial matched the reference. Enable `SHOP_PROFILE_CPU=1`
 for phase CPU time and average active workers, and use `--no-overlap-links`
 to reproduce serial link setup.
 
+Two-tier radix partitioning uses 256 ingest buckets per worker and subdivides
+them into 4,096 partitions for deduplication. Three alternating pinned runs
+gave a **3.082 s** median versus **3.266 s** when parsing directly into 4,096
+buckets. Peak RSS fell from about 4,006 MiB to 3,723 MiB. All outputs matched.
+Use `--ingest-shards 0` to parse directly into the final dedup buckets.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
