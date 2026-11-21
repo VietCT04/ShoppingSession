@@ -86,6 +86,7 @@ struct Options {
     bool fast_time=true;
     bool narrow_events=true;
     bool direct_dedup=false,direct_encoding=true;
+    bool overlap_links=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -120,6 +121,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--direct-dedup")o.direct_dedup=true;
         else if(arg=="--direct-encoding")o.direct_encoding=true;
         else if(arg=="--no-direct-encoding")o.direct_encoding=false;
+        else if(arg=="--overlap-links")o.overlap_links=true;
+        else if(arg=="--no-overlap-links")o.overlap_links=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -137,6 +140,7 @@ Options options(int argc,char** argv) {
     if(!o.dedup_shards||o.baseline)o.dedup_shards=o.shards;
     if(!o.ingest_shards||o.baseline)o.ingest_shards=o.dedup_shards;
     if(o.baseline)o.fast_time=false;
+    if(o.baseline)o.overlap_links=false;
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup_shards<1||o.dedup_shards>16384||(o.dedup_shards&(o.dedup_shards-1)))throw std::runtime_error("dedup-shards must be a power of two in 1..16384");
     if(o.ingest_shards<1||o.ingest_shards>o.dedup_shards||(o.ingest_shards&(o.ingest_shards-1)))
@@ -204,6 +208,14 @@ struct Pipeline {
             for(auto& t:dense_totals)t.resize(size_t(days)*campaign_names.size());
         }
         for(auto p:files(o.data/"links"))in.add(p,in.links);
+        if(!o.overlap_links)build_links();
+        for(auto p:files(o.data/"events"))in.add(p,in.events);
+        for(auto p:files(o.data/"clicks"))in.add(p,in.clicks);
+        fs::create_directories(o.out/"user_daily");fs::create_directories(o.out/"campaign_daily");
+        // Replace only our table outputs, so rerunning never leaves extra rows.
+        for(auto table:{"user_daily","campaign_daily"})for(auto p:files_parquet(o.out/table))fs::remove(p);
+    }
+    void build_links() {
         for(auto chunk:in.links)Inputs::lines(chunk,[&](SV line){
             std::array<SV,2> f;if(csv(line,f)&&!f[0].empty()&&!f[1].empty())people.join(f[0],f[1]);
         });
@@ -216,11 +228,6 @@ struct Pipeline {
             std::vector<uint32_t>().swap(people.parents);std::vector<uint32_t>().swap(people.sizes);
         }
 #endif
-        for(auto p:files(o.data/"events"))in.add(p,in.events);
-        for(auto p:files(o.data/"clicks"))in.add(p,in.clicks);
-        fs::create_directories(o.out/"user_daily");fs::create_directories(o.out/"campaign_daily");
-        // Replace only our table outputs, so rerunning never leaves extra rows.
-        for(auto table:{"user_daily","campaign_daily"})for(auto p:files_parquet(o.out/table))fs::remove(p);
     }
     static std::vector<fs::path> files_parquet(const fs::path& dir) {
         std::vector<fs::path> r;for(auto& p:fs::directory_iterator(dir))if(p.is_regular_file()&&p.path().extension()==".parquet")r.push_back(p.path());return r;
@@ -243,7 +250,13 @@ struct Pipeline {
     }
     int64_t parse_time(SV s)const{return o.fast_time?strict_time.parse(s):timestamp(s);}
     void parse_events() {
-        parallel(in.events.size(),o.threads,[&](size_t i,int worker){
+        parallel(in.events.size()+size_t(o.overlap_links),o.threads,[&](size_t i,int worker){
+            if(o.overlap_links) {
+                // This job owns the link graph. The other jobs carry raw user
+                // IDs until the barrier, and therefore never read it early.
+                if(!i){build_links();return;}
+                --i;
+            }
             records<7>(in.events[i],[&](const std::array<SV,7>& f){
                 if(f[0].empty())return;
                 // Invalid winners remain in the dedup input. A later valid copy
@@ -259,8 +272,10 @@ struct Pipeline {
                 }
                 if(!valid)ts=-1;
                 Key event_id(f[0]);
+                Key user_id(f[1]);
+                Key person=o.overlap_links?user_id:canonical(user_id);
                 size_t bucket=KeyHash{}(event_id)&(o.ingest_shards-1);
-                raw[worker][bucket].push_back({event_id,canonical(Key(f[1])),ts,ingest,uint32_t(price),category});
+                raw[worker][bucket].push_back({event_id,person,ts,ingest,uint32_t(price),category});
             });
         });
     }
@@ -268,7 +283,11 @@ struct Pipeline {
         parallel(o.ingest_shards,o.threads,[&](size_t s,int worker){
             size_t count=0;for(auto& w:raw)count+=w[s].size();
             if(!count)return;
-            auto emit=[&](const Raw& r){if(r.ts>=start)events[worker][shard(r.person)].push_back({r.person,r.ts,r.price,r.category});};
+            auto emit=[&](const Raw& r) {
+                if(r.ts<start)return;
+                Key person=o.overlap_links?canonical(r.person):r.person;
+                events[worker][shard(person)].push_back({person,r.ts,r.price,r.category});
+            };
             if(o.ingest_shards!=o.dedup_shards) {
                 size_t partitions=o.dedup_shards/o.ingest_shards;
                 size_t bits=std::countr_zero(unsigned(o.ingest_shards));
@@ -557,8 +576,8 @@ struct Pipeline {
     }
     void run(){
         Timer t(o.threads);
-        load();t.mark("load_links");
-        parse_events();t.mark("parse_events");
+        load();t.mark(o.overlap_links?"load_inputs":"load_links");
+        parse_events();t.mark(o.overlap_links?"parse_events_and_links":"parse_events");
         dedup();t.mark("dedup");
         parse_clicks();t.mark("parse_clicks");
         sessionize();t.mark("sessions_and_user_output");

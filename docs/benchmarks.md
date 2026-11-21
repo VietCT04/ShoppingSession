@@ -141,6 +141,14 @@ compaction. Across three alternating 20M runs, the median was **3.854 s** versus
 experiment skipping the raw gather during deduplication took 3.933 s alone
 and 3.908 s with direct encoding, so that path remains opt-in.
 
+On eight pinned cores, event parsing and deduplication initially averaged 7.64
+and 7.93 active workers, while link setup used one core for about 0.475 s.
+Scheduling link setup alongside CSV parsing and resolving canonical names
+only for dedup winners improved the five-run alternating median to **3.240 s**
+from **3.712 s**. Every trial matched the reference. Enable `SHOP_PROFILE_CPU=1`
+for phase CPU time and average active workers, and use `--no-overlap-links`
+to reproduce serial link setup.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
