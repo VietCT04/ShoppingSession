@@ -429,3 +429,10 @@ A separate five-pair comparison of the current and previous profile-guided
 builds measured **0.953 vs 1.040 seconds** on the same pinned CPUs. All ten
 20M outputs matched. The current build includes the smaller validation path,
 reserved routing vectors, and the UTC date cache.
+
+Linked-user groups store four-byte event timestamps and a separate stream
+of purchases. After sorting both by time, the last event in each session
+delimits its purchases. On the UTC cache build, the five-pair 20M median
+was **1.372 vs 1.378 seconds** and peak RSS was about 60 MiB lower. An
+earlier paired batch measured **1.376 vs 1.397 seconds**. Every comparison
+matched the reference. Use `--inline-group-purchases` for the original layout.

@@ -89,6 +89,10 @@ struct LinkedEvent {
     uint32_t ts,purchase;
     bool operator<(const LinkedEvent& other)const{return ts<other.ts;}
 };
+struct LinkedTimestamp {
+    uint32_t ts;
+    bool operator<(const LinkedTimestamp& other)const{return ts<other.ts;}
+};
 struct LinkedClick {
     Key id;uint32_t ts,campaign;
     bool operator<(const LinkedClick& other)const{return ts!=other.ts?ts<other.ts:id>other.id;}
@@ -144,6 +148,7 @@ struct Options {
     bool branchless_event_validation=true;
     bool reserve_routes=true;
     bool cache_utc_days=true;
+    bool split_group_purchases=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -218,6 +223,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--grow-routes")o.reserve_routes=false;
         else if(arg=="--cache-utc-days")o.cache_utc_days=true;
         else if(arg=="--no-cache-utc-days")o.cache_utc_days=false;
+        else if(arg=="--split-group-purchases")o.split_group_purchases=true;
+        else if(arg=="--inline-group-purchases")o.split_group_purchases=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -833,17 +840,22 @@ struct Pipeline {
         std::vector<T>().swap(input);
         return {std::move(output),sum};
     }
-    void sessionize_linked_groups() {
-        struct EventInput {LinkedEvent event;uint32_t person;};
+    template<bool SplitPurchases=false>void sessionize_linked_groups() {
+        using GroupEvent=std::conditional_t<SplitPurchases,LinkedTimestamp,LinkedEvent>;
+        struct NoPurchases {};
+        struct EventInput {GroupEvent event;uint32_t person;};
+        struct PurchaseInput {LinkedEvent event;uint32_t person;};
         struct ClickInput {LinkedClick click;uint32_t person;};
         struct Source {
-            Grouped<LinkedEvent> events;
+            Grouped<GroupEvent> events;
             Grouped<LinkedClick> clicks;
+            [[no_unique_address]] std::conditional_t<SplitPurchases,Grouped<LinkedEvent>,NoPurchases> purchases;
         };
         struct Group {
             Key name;
-            std::span<LinkedEvent> events;
+            std::span<GroupEvent> events;
             std::span<LinkedClick> clicks;
+            [[no_unique_address]] std::conditional_t<SplitPurchases,std::span<LinkedEvent>,NoPurchases> purchases;
         };
         std::vector<Source> sources(o.shards);
         Workers<Group> grouped(o.threads,Buckets<Group>(o.shards));
@@ -851,18 +863,28 @@ struct Pipeline {
             auto before=Clock::now();
             KeyFlatMap<uint32_t> codes;
             std::vector<Key> names;
-            std::vector<size_t> event_counts,click_counts;
+            std::vector<size_t> event_counts,click_counts,purchase_counts;
             auto person_code=[&](Key name) {
                 auto [entry,added]=codes.try_emplace(name,names.size());
-                if(added){names.push_back(name);event_counts.push_back(0);click_counts.push_back(0);}
+                if(added) {
+                    names.push_back(name);event_counts.push_back(0);click_counts.push_back(0);
+                    if constexpr(SplitPurchases)purchase_counts.push_back(0);
+                }
                 return entry->second;
             };
             std::vector<EventInput> ev;ev.reserve(event_bucket_size(s));
+            std::vector<PurchaseInput> purchases;
             consume_bucket(routed_events,s,[&](const RoutedEvent& event) {
                 if(o.mark_duplicate_events&&event.offset==CompactRaw::invalid)return;
                 auto code=person_code(event.person);
                 ++event_counts[code];
-                ev.push_back({{event.offset,event.purchase},code});
+                if constexpr(SplitPurchases) {
+                    ev.push_back({{event.offset},code});
+                    if(event.purchase) {
+                        purchases.push_back({{event.offset,event.purchase},code});
+                        ++purchase_counts[code];
+                    }
+                } else ev.push_back({{event.offset,event.purchase},code});
             });
             std::vector<ClickInput> cl;cl.reserve(click_bucket_size(s));
             consume_bucket(routed_clicks,s,[&](const RoutedClick& click) {
@@ -871,14 +893,19 @@ struct Pipeline {
                 cl.push_back({{click.id,click.offset,click.campaign},code});
             });
             auto& source=sources[s];
-            source.events=group_records<EventInput,LinkedEvent>(ev,event_counts,[](const EventInput& row){return row.event;});
+            source.events=group_records<EventInput,GroupEvent>(ev,event_counts,[](const EventInput& row){return row.event;});
             source.clicks=group_records<ClickInput,LinkedClick>(cl,click_counts,[](const ClickInput& row){return row.click;});
+            if constexpr(SplitPurchases)source.purchases=group_records<PurchaseInput,LinkedEvent>(purchases,purchase_counts,
+                [](const PurchaseInput& row){return row.event;});
             for(size_t i=0;i<names.size();++i) {
                 Key person=canonical(names[i]);
                 size_t destination=person==names[i]?s:shard(person);
-                grouped[worker][destination].push_back({person,
+                Group group{person,
                     {source.events.data.get()+event_counts[i],event_counts[i+1]-event_counts[i]},
-                    {source.clicks.data.get()+click_counts[i],click_counts[i+1]-click_counts[i]}});
+                    {source.clicks.data.get()+click_counts[i],click_counts[i+1]-click_counts[i]}};
+                if constexpr(SplitPurchases)group.purchases={source.purchases.data.get()+purchase_counts[i],
+                    purchase_counts[i+1]-purchase_counts[i]};
+                grouped[worker][destination].push_back(group);
             }
             profiles[worker].intern+=elapsed(before);
         });
@@ -890,25 +917,35 @@ struct Pipeline {
             if(groups.size()>1)duckdb_pdqsort::pdqsort(groups.begin(),groups.end(),[](auto& a,auto& b){return a.name<b.name;});
             profiles[worker].sort+=elapsed(before);
             auto enumerate=[&](auto consume) {
-                std::vector<LinkedEvent> merged_events;
+                std::vector<GroupEvent> merged_events;
                 std::vector<LinkedClick> merged_clicks;
+                std::vector<LinkedEvent> merged_purchases;
                 for(size_t i=0;i<groups.size();) {
                     size_t finish=i+1;
                     while(finish<groups.size()&&groups[finish].name==groups[i].name)++finish;
                     auto ev=groups[i].events;
                     auto cl=groups[i].clicks;
+                    auto purchases=groups[i].purchases;
                     if(finish>i+1) {
                         merged_events.clear();merged_clicks.clear();
+                        if constexpr(SplitPurchases)merged_purchases.clear();
                         for(size_t j=i;j<finish;++j) {
                             merged_events.insert(merged_events.end(),groups[j].events.begin(),groups[j].events.end());
                             merged_clicks.insert(merged_clicks.end(),groups[j].clicks.begin(),groups[j].clicks.end());
+                            if constexpr(SplitPurchases)merged_purchases.insert(merged_purchases.end(),
+                                groups[j].purchases.begin(),groups[j].purchases.end());
                         }
                         ev=std::span(merged_events);cl=std::span(merged_clicks);
+                        if constexpr(SplitPurchases)purchases=std::span(merged_purchases);
                     }
                     if(!ev.empty()) {
                         sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
                         if(cl.size()>1)sort_group(cl.data(),cl.data()+cl.size(),[](auto& a,auto& b){return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;});
-                        consume(groups[i].name,ev,cl,start,start-WEEK);
+                        if constexpr(SplitPurchases) {
+                            if(purchases.size()>1)sort_group(purchases.data(),purchases.data()+purchases.size(),
+                                [](auto& a,auto& b){return a.ts<b.ts;});
+                            consume(groups[i].name,ev,cl,start,start-WEEK,purchases);
+                        } else consume(groups[i].name,ev,cl,start,start-WEEK);
                     }
                     i=finish;
                 }
@@ -981,10 +1018,11 @@ struct Pipeline {
             std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",count_type},{"events",count_type},{"revenue_cents",2},{"top_category",6,true}};
             CampaignWindow campaign_window((Arrays||o.array_active)?campaign_names.size():0);
             CategoryRevenue category_revenue((Arrays||o.array_categories)?categories.size():0);
-            enumerate([&](Key person_name,auto ev,auto cl,int64_t time_base,int64_t click_base) {
+            enumerate([&](Key person_name,auto ev,auto cl,int64_t time_base,int64_t click_base,
+                          std::span<LinkedEvent> purchases={}) {
                 ShortId::Buffer decoded_name;
                 SV person=text(person_name,decoded_name);
-                size_t hi=0,lo=0;
+                size_t hi=0,lo=0,purchase_index=0;
                 struct Unused {};
                 std::conditional_t<Arrays,Unused,std::unordered_map<uint32_t,size_t>> active;
                 campaign_window.clear();
@@ -1018,7 +1056,20 @@ struct Pipeline {
                     }
                     size_t j=i+1;while(j<ev.size()&&ev[j].ts-ev[j-1].ts<=GAP)++j;
                     int64_t revenue=0;
-                    for(size_t k=i;k<j;++k) {
+                    auto add_purchase=[&](uint32_t price,uint32_t category) {
+                        if(!price)return;
+                        revenue+=price;
+                        if(Arrays||o.array_categories)category_revenue.add(category,price);
+                        else if constexpr(!Arrays)cat_revenue[category]+=price;
+                    };
+                    if constexpr(std::is_same_v<typename decltype(ev)::element_type,LinkedTimestamp>) {
+                        // Every purchase still has a timestamp in ev. The
+                        // session's last event bounds its purchase stream.
+                        while(purchase_index<purchases.size()&&purchases[purchase_index].ts<=ev[j-1].ts) {
+                            uint32_t packed=purchases[purchase_index++].purchase;
+                            add_purchase(packed&CompactRaw::price_mask,packed>>24);
+                        }
+                    } else for(size_t k=i;k<j;++k) {
                         uint32_t price,category;
                         if constexpr(std::is_same_v<typename decltype(ev)::element_type,LinkedEvent>) {
                             price=ev[k].purchase&CompactRaw::price_mask;
@@ -1027,10 +1078,7 @@ struct Pipeline {
                             price=ev[k].price;
                             category=ev[k].category;
                         }
-                        if(!price)continue;
-                        revenue+=price;
-                        if(Arrays||o.array_categories)category_revenue.add(category,price);
-                        else if constexpr(!Arrays)cat_revenue[category]+=price;
+                        add_purchase(price,category);
                     }
                     ++ns;ne+=j-i;nr+=revenue;
                     uint32_t credited=0;
@@ -1119,7 +1167,10 @@ struct Pipeline {
             ingest_and_dedup<Raw>(t);
         }
         parse_clicks();t.mark("parse_clicks");
-        if(o.redirect_linked_groups)sessionize_linked_groups();
+        if(o.redirect_linked_groups) {
+            if(o.split_group_purchases)sessionize_linked_groups<true>();
+            else sessionize_linked_groups();
+        }
         else sessionize();
         report_session_profile();
         t.mark("sessions_and_user_output");
