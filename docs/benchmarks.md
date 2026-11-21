@@ -163,6 +163,12 @@ probes, with all outputs matching. Largest-first session scheduling measured
 3.253 s in the same experiment and remains opt-in. Use `--no-tag-links` for
 scalar linked-user probes.
 
+The runtime-dispatched AVX2 CSV scanner enumerates delimiters and uses a
+separate quote mask. Event parse wall time fell in all five paired trials,
+with a median of **0.865 s** versus **0.942 s**. The complete benchmark
+medians were **2.868 s** and **2.889 s** respectively, with all outputs equal.
+Use `--no-avx2-csv` to select the SSE2 scanner on an AVX2-capable CPU.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

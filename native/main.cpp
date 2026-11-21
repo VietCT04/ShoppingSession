@@ -87,6 +87,7 @@ struct Options {
     bool narrow_events=true;
     bool direct_dedup=false,direct_encoding=true;
     bool overlap_links=true;
+    bool avx2_csv=true;
     bool tag_links=true,heavy_shards_first=false;
     bool sparse_duplicates=false;
     std::string dedup="flat";
@@ -125,6 +126,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-direct-encoding")o.direct_encoding=false;
         else if(arg=="--overlap-links")o.overlap_links=true;
         else if(arg=="--no-overlap-links")o.overlap_links=false;
+        else if(arg=="--avx2-csv")o.avx2_csv=true;
+        else if(arg=="--no-avx2-csv")o.avx2_csv=false;
         else if(arg=="--tag-links")o.tag_links=true;
         else if(arg=="--no-tag-links")o.tag_links=false;
         else if(arg=="--heavy-shards-first")o.heavy_shards_first=true;
@@ -256,6 +259,12 @@ struct Pipeline {
         return totals[worker][{day,campaign}];
     }
     template<size_t N,class F>void records(Chunk chunk,F consume)const {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        if(o.fused_csv&&o.avx2_csv&&avx2_csv_available()) {
+            scan_csv_avx2<N>(chunk,consume);
+            return;
+        }
+#endif
         if(o.fused_csv)scan_csv<N>(chunk,consume);
         else Inputs::lines(chunk,[&](SV line){std::array<SV,N> fields;if(csv(line,fields))consume(fields);});
     }
