@@ -63,7 +63,7 @@ template<class T> using Workers=std::vector<Buckets<T>>;
 
 struct Options {
     fs::path data="/data",out="/output";
-    int threads=8,shards=256;
+    int threads=8,shards=256,dedup_shards=4096;
     bool baseline=false;
 #ifdef SHOP_PACKED_IDS
     bool compact=false;
@@ -100,6 +100,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--ordered-ingest")o.ordered_ingest=true;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
+        else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
         else if(arg=="--dedup"&&i+1<argc)o.dedup=argv[++i];
         else if(arg=="--sorter"&&i+1<argc)o.sorter=argv[++i];
         else if(arg=="--group-sort"&&i+1<argc)o.group_sort=argv[++i];
@@ -110,7 +111,9 @@ Options options(int argc,char** argv) {
         else throw std::runtime_error("too many paths");
     }
     if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.fused_csv=false;o.ordered_ingest=false;o.sorter="std";}
+    if(!o.dedup_shards||o.baseline)o.dedup_shards=o.shards;
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
+    if(o.dedup_shards<1||o.dedup_shards>16384||(o.dedup_shards&(o.dedup_shards-1)))throw std::runtime_error("dedup-shards must be a power of two in 1..16384");
     if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat"&&o.dedup!="dense")throw std::runtime_error("dedup must be sort, hash, flat, or dense");
     if(o.sorter!="std"&&o.sorter!="duckdb")throw std::runtime_error("sorter must be std or duckdb");
     if(o.group_sort!="duckdb"&&o.group_sort!="ips4o"&&o.group_sort!="ips2ra")throw std::runtime_error("group-sort must be duckdb, ips4o, or ips2ra");
@@ -134,11 +137,12 @@ struct Pipeline {
     std::vector<CampaignTotals> totals;
     std::vector<std::vector<Aggregate>> dense_totals;
     std::vector<WorkProfile> profiles;
-    explicit Pipeline(Options options):o(std::move(options)),raw(o.threads,Buckets<Raw>(o.shards)),
+    explicit Pipeline(Options options):o(std::move(options)),raw(o.threads,Buckets<Raw>(o.dedup_shards)),
         events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
     using Clock=std::chrono::steady_clock;
     static double elapsed(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
     size_t shard(Key s)const{return KeyHash{}(s)&(o.shards-1);}
+    size_t event_shard(Key s)const{return KeyHash{}(s)&(o.dedup_shards-1);}
     void load() {
         std::ifstream mf(o.data/"manifest.json");
         if(!mf)throw std::runtime_error("cannot open manifest.json");
@@ -225,13 +229,14 @@ struct Pipeline {
                 }
                 if(!valid)ts=-1;
                 Key event_id(f[0]);
-                raw[worker][shard(event_id)].push_back({event_id,canonical(Key(f[1])),ts,ingest,uint32_t(price),category});
+                raw[worker][event_shard(event_id)].push_back({event_id,canonical(Key(f[1])),ts,ingest,uint32_t(price),category});
             });
         });
     }
     void dedup() {
-        parallel(o.shards,o.threads,[&](size_t s,int worker){
+        parallel(o.dedup_shards,o.threads,[&](size_t s,int worker){
             size_t count=0;for(auto& w:raw)count+=w[s].size();
+            if(!count)return;
             std::vector<Raw> rows;rows.reserve(count);
             for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<Raw>().swap(w[s]);}
             auto emit=[&](const Raw& r){if(r.ts>=start)events[worker][shard(r.person)].push_back({r.person,r.ts,r.price,r.category});};

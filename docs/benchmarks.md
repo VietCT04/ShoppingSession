@@ -88,6 +88,23 @@ plus the dev answers and randomized boundary checks. Alternating 20M medians
 were 4.548 seconds for the control and 4.694 for the experiment, so it remains
 disabled and has not replaced the validated production path.
 
+Deduplication partition counts were then decoupled from person/output
+partitioning, as a cache-locality experiment on our existing pipeline. All twelve
+alternating 20M runs match the baseline:
+
+| Dedup partitions (person/output partitions remain 256) | Median seconds |
+| --- | ---: |
+| 256, control | 4.600 |
+| 1024 | 4.350 |
+| 4096 | **4.287** |
+| 16384 | 4.617 |
+
+4096 is selected. Its dedup phase took approximately 0.40–0.47 seconds versus
+about 1 second with 256 partitions. Peak RSS was roughly 4 GiB. `--dedup-shards 0`
+uses the person partition count for historical comparisons. All 540 fixture/
+configuration checks and official dev answers pass. This is independent work;
+no external competition implementation was incorporated.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
