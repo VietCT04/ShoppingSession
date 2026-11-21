@@ -146,6 +146,11 @@ int main(int argc,char** argv) {
             const auto narrow_control=configs.back().flags;
             configs.push_back({"direct-encoding",narrow_control});
             configs.back().flags.push_back("--direct-encoding");
+            const auto ingest_control=configs.back().flags;
+            configs.push_back({"ingest-256",ingest_control});
+            configs.back().flags.insert(configs.back().flags.end(),{"--ingest-shards","256"});
+            configs.push_back({"ingest-1024",ingest_control});
+            configs.back().flags.insert(configs.back().flags.end(),{"--ingest-shards","1024"});
             configs.push_back({"direct-dedup",narrow_control});
             configs.back().flags.push_back("--direct-dedup");
             configs.push_back({"direct-both",configs.back().flags});
