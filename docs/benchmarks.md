@@ -369,3 +369,10 @@ With reserved raw partitions, the profile-guided production build measured
 an exact **1.108-second** median over five pinned 20M runs. The ordinary build
 measured **1.176 seconds** in the same alternating batch. The separate official
 dev workload supplied the profile counters.
+
+For compact linked-user inputs, parsing puts valid payloads in their user
+partitions and carries an event ID, ingest time and location through dedup.
+Dedup marks losing payloads in place, including valid copies whose earliest
+copy was invalid. The five-pair median improved from **1.520 to 1.478 seconds**
+with about 180 MiB less peak RSS. Both tables matched the reference every run.
+Use `--copy-dedup-winners` to compare routing the surviving records afterward.

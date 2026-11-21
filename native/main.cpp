@@ -45,6 +45,7 @@ struct DenseKeyHash {
     size_t operator()(const Key& key)const noexcept {auto h=KeyHash{}(key);return h^(h>>32);}
 };
 struct Raw {Key id,person;int64_t ts,ingest;uint32_t price,category;};
+struct RawLocation {Key id;int64_t ingest;uint64_t location;};
 struct CompactRaw {
     Key id,person;
     int64_t ingest;
@@ -134,6 +135,7 @@ struct Options {
     bool redirect_linked_groups=true;
     bool specialize_aggregation=true;
     bool raw_arena=true;
+    bool mark_duplicate_events=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -198,6 +200,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--generic-aggregation")o.specialize_aggregation=false;
         else if(arg=="--raw-arena")o.raw_arena=true;
         else if(arg=="--vector-raw")o.raw_arena=false;
+        else if(arg=="--mark-duplicate-events")o.mark_duplicate_events=true;
+        else if(arg=="--copy-dedup-winners")o.mark_duplicate_events=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -412,7 +416,17 @@ struct Pipeline {
                 Key user_id(f[1]);
                 Key person=o.overlap_links?user_id:canonical(user_id);
                 size_t bucket=KeyHash{}(event_id)&(o.ingest_shards-1);
-                if constexpr(std::is_same_v<R,CompactRaw>) {
+                if constexpr(std::is_same_v<R,RawLocation>) {
+                    uint64_t location=0;
+                    if(valid) {
+                        size_t destination=shard(person);
+                        auto& target=routed_events[worker][destination];
+                        if(target.size()>=UINT32_MAX)throw std::runtime_error("too many events in one worker partition");
+                        location=(uint64_t(worker)<<48)|(uint64_t(destination)<<32)|(target.size()+1);
+                        target.push_back({person,uint32_t(ts-start),uint32_t(price)|(category<<24)});
+                    }
+                    raw[worker][bucket].push_back({event_id,ingest,location});
+                } else if constexpr(std::is_same_v<R,CompactRaw>) {
                     uint32_t offset=valid?uint32_t(ts-start):CompactRaw::invalid;
                     uint32_t purchase_info=(uint32_t(price)&CompactRaw::price_mask)|(category<<24);
                     raw[worker][bucket].push_back({event_id,person,ingest,offset,purchase_info});
@@ -425,6 +439,51 @@ struct Pipeline {
     template<class Buffer>static void release_raw(Buffer& buffer) {
         if constexpr(requires {buffer.release();})buffer.release();
         else Buffer().swap(buffer);
+    }
+    // Records already reside in their user partitions. Only losing copies
+    // need a write after the earliest-ingest comparison.
+    template<class Buffer>void mark_duplicate_locations(std::vector<std::vector<Buffer>>& raw) {
+        auto drop=[&](uint64_t location) {
+            if(location)routed_events[location>>48][(location>>32)&65535][uint32_t(location)-1].offset=CompactRaw::invalid;
+        };
+        parallel(o.ingest_shards,o.threads,[&](size_t s,int) {
+            size_t count=0;
+            for(const auto& worker:raw)count+=worker[s].size();
+            if(!count)return;
+            size_t partitions=o.dedup_shards/o.ingest_shards;
+            unsigned shift=std::countr_zero(unsigned(o.ingest_shards));
+            std::vector<std::vector<RawLocation>> rows(partitions);
+            for(auto& part:rows)part.reserve(count/partitions+count/partitions/8+16);
+            for(auto& worker:raw) {
+                for(const auto& row:worker[s])rows[event_shard(row.id)>>shift].push_back(row);
+                release_raw(worker[s]);
+            }
+            for(const auto& part:rows) {
+                if(part.size()<2)continue;
+                std::array<uint64_t,1024> seen{},repeated{};
+                std::vector<uint16_t> tags;
+                tags.reserve(part.size());
+                for(const auto& row:part) {
+                    uint16_t tag=uint64_t(KeyHash{}(row.id))>>32;
+                    tags.push_back(tag);
+                    uint64_t bit=uint64_t{1}<<(tag&63);
+                    repeated[tag>>6]|=seen[tag>>6]&bit;
+                    seen[tag>>6]|=bit;
+                }
+                KeyFlatMap<size_t> winners;
+                winners.reserve(part.size()/8);
+                for(size_t i=0;i<part.size();++i) {
+                    uint16_t tag=tags[i];
+                    if(!(repeated[tag>>6]&(uint64_t{1}<<(tag&63))))continue;
+                    const auto& row=part[i];
+                    auto [entry,added]=winners.try_emplace(row.id,i);
+                    if(added)continue;
+                    const auto& current=part[entry->second];
+                    if(row.ingest<current.ingest){drop(current.location);entry->second=i;}
+                    else drop(row.location);
+                }
+            }
+        });
     }
     template<class R,class Buffer> void dedup(std::vector<std::vector<Buffer>>& raw) {
         parallel(o.ingest_shards,o.threads,[&](size_t s,int worker){
@@ -739,6 +798,7 @@ struct Pipeline {
             };
             std::vector<EventInput> ev;ev.reserve(event_bucket_size(s));
             consume_bucket(routed_events,s,[&](const RoutedEvent& event) {
+                if(o.mark_duplicate_events&&event.offset==CompactRaw::invalid)return;
                 auto code=person_code(event.person);
                 ++event_counts[code];
                 ev.push_back({{event.offset,event.purchase},code});
@@ -964,7 +1024,8 @@ struct Pipeline {
         auto process_raw=[&](auto& raw) {
             parse_events<R>(raw);
             timer.mark(o.overlap_links?"parse_events_and_links":"parse_events");
-            dedup<R>(raw);
+            if constexpr(std::is_same_v<R,RawLocation>)mark_duplicate_locations(raw);
+            else dedup<R>(raw);
             timer.mark("dedup");
         };
         if(o.raw_arena&&!o.baseline&&!in.events.empty()) {
@@ -983,8 +1044,12 @@ struct Pipeline {
         load();t.mark(o.overlap_links?"load_inputs":"load_links");
         // Reserve one offset as an invalid-row marker and retain a wide path
         // for long windows or product dictionaries with more categories.
-        if(o.compact_raw&&uint64_t(end-start)<=UINT32_MAX&&categories.size()<=256) {
-            ingest_and_dedup<CompactRaw>(t);
+        bool narrow_raw=o.compact_raw&&uint64_t(end-start)<=UINT32_MAX&&categories.size()<=256;
+        o.mark_duplicate_events=o.mark_duplicate_events&&narrow_raw&&o.redirect_linked_groups&&
+            o.sparse_duplicates&&o.dedup=="flat";
+        if(narrow_raw) {
+            if(o.mark_duplicate_events)ingest_and_dedup<RawLocation>(t);
+            else ingest_and_dedup<CompactRaw>(t);
         } else {
             ingest_and_dedup<Raw>(t);
         }
