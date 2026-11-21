@@ -87,7 +87,7 @@ struct Options {
     bool narrow_events=true;
     bool direct_dedup=false,direct_encoding=true;
     bool overlap_links=true;
-    bool tag_links=false,heavy_shards_first=false;
+    bool tag_links=true,heavy_shards_first=false;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -125,6 +125,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--overlap-links")o.overlap_links=true;
         else if(arg=="--no-overlap-links")o.overlap_links=false;
         else if(arg=="--tag-links")o.tag_links=true;
+        else if(arg=="--no-tag-links")o.tag_links=false;
         else if(arg=="--heavy-shards-first")o.heavy_shards_first=true;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
@@ -145,6 +146,7 @@ Options options(int argc,char** argv) {
     if(!o.ingest_shards||o.baseline)o.ingest_shards=o.dedup_shards;
     if(o.baseline)o.fast_time=false;
     if(o.baseline)o.overlap_links=false;
+    if(o.baseline)o.tag_links=false;
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup_shards<1||o.dedup_shards>16384||(o.dedup_shards&(o.dedup_shards-1)))throw std::runtime_error("dedup-shards must be a power of two in 1..16384");
     if(o.ingest_shards<1||o.ingest_shards>o.dedup_shards||(o.ingest_shards&(o.ingest_shards-1)))

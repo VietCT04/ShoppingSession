@@ -155,6 +155,14 @@ gave a **3.082 s** median versus **3.266 s** when parsing directly into 4,096
 buckets. Peak RSS fell from about 4,006 MiB to 3,723 MiB. All outputs matched.
 Use `--ingest-shards 0` to parse directly into the final dedup buckets.
 
+The read-only linked-user table now checks 16 metadata bytes at a time before
+loading candidate keys. Full key equality still decides every match. The layout
+is inspired by [Swiss tables](https://abseil.io/about/design/swisstables).
+The pinned alternating median was **2.973 s** versus **3.157 s** with scalar
+probes, with all outputs matching. Largest-first session scheduling measured
+3.253 s in the same experiment and remains opt-in. Use `--no-tag-links` for
+scalar linked-user probes.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
