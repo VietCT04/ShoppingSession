@@ -117,6 +117,7 @@ struct Options {
     bool inline_short_links=true;
     bool packed_routing=true;
     bool fast_link_csv=true,reserve_links=true;
+    bool batch_link_probes=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -171,6 +172,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--fast-link-csv")o.fast_link_csv=true;
         else if(arg=="--reserve-links")o.reserve_links=true;
         else if(arg=="--legacy-link-input"){o.fast_link_csv=false;o.reserve_links=false;}
+        else if(arg=="--batch-link-probes")o.batch_link_probes=true;
+        else if(arg=="--unbatched-link-probes")o.batch_link_probes=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -327,6 +330,16 @@ struct Pipeline {
         auto it=person_lookup.find(s);return it==person_lookup.end()?s:people.names[it->second];
 #endif
     }
+#ifdef SHOP_SHORT_IDS
+    std::pair<Key,size_t> canonical_shard(Key person,size_t hash)const {
+        auto* alias=people.index.find(person,hash);
+        if(alias&&alias->second!=person.word) {
+            person.word=alias->second;
+            hash=KeyHash{}(person);
+        }
+        return {person,hash&(o.shards-1)};
+    }
+#endif
     Aggregate& total(int worker,int64_t day,uint32_t campaign) {
         if(o.dense_totals)return dense_totals[worker][size_t(day-dayof(start))*campaign_names.size()+campaign];
         return totals[worker][{day,campaign}];
@@ -383,6 +396,27 @@ struct Pipeline {
         parallel(o.ingest_shards,o.threads,[&](size_t s,int worker){
             size_t count=0;for(auto& w:raw)count+=w[s].size();
             if(!count)return;
+            auto append=[&](Event event,size_t destination) {
+                if(routed_events.empty())events[worker][destination].push_back(event);
+                else routed_events[worker][destination].push_back({event.person,uint32_t(event.ts-start),
+                                                                   event.price|(event.category<<24)});
+            };
+#ifdef SHOP_SHORT_IDS
+            struct Pending {Event event;size_t hash,destination;};
+            std::array<Pending,16> pending;
+            size_t used=0;
+            bool batch=o.batch_link_probes&&o.overlap_links&&o.inline_short_links&&people.index.size()!=0;
+            auto flush_links=[&] {
+                for(size_t i=0;i<used;++i) {
+                    auto& entry=pending[i];
+                    auto [person,destination]=canonical_shard(entry.event.person,entry.hash);
+                    entry.event.person=person;
+                    entry.destination=destination;
+                }
+                for(size_t i=0;i<used;++i)append(pending[i].event,pending[i].destination);
+                used=0;
+            };
+#endif
             auto emit=[&](const R& r) {
                 int64_t ts;
                 uint32_t price,category;
@@ -397,10 +431,17 @@ struct Pipeline {
                     price=r.price;
                     category=r.category;
                 }
+#ifdef SHOP_SHORT_IDS
+                if(batch) {
+                    size_t hash=KeyHash{}(r.person);
+                    people.index.prefetch(hash);
+                    pending[used++]={{r.person,ts,price,category},hash,0};
+                    if(used==pending.size())flush_links();
+                    return;
+                }
+#endif
                 Key person=o.overlap_links?canonical(r.person):r.person;
-                size_t destination=shard(person);
-                if(routed_events.empty())events[worker][destination].push_back({person,ts,price,category});
-                else routed_events[worker][destination].push_back({person,uint32_t(ts-start),price|(category<<24)});
+                append({person,ts,price,category},shard(person));
             };
             if(o.ingest_shards!=o.dedup_shards) {
                 size_t partitions=o.dedup_shards/o.ingest_shards;
@@ -416,9 +457,7 @@ struct Pipeline {
                     std::vector<R>().swap(buckets[s]);
                 }
                 for(auto& rows:subpartitions)if(!rows.empty())dedup_rows(rows,emit);
-                return;
-            }
-            if(o.direct_dedup&&o.dedup=="flat") {
+            } else if(o.direct_dedup&&o.dedup=="flat") {
                 KeyFlatMap<const R*> winners;
                 winners.reserve(count);
                 for(const auto& buckets:raw) {
@@ -429,11 +468,14 @@ struct Pipeline {
                 }
                 winners.each([&](const Key&,const R* event){emit(*event);});
                 for(auto& buckets:raw)std::vector<R>().swap(buckets[s]);
-                return;
+            } else {
+                std::vector<R> rows;rows.reserve(count);
+                for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<R>().swap(w[s]);}
+                dedup_rows(rows,emit);
             }
-            std::vector<R> rows;rows.reserve(count);
-            for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<R>().swap(w[s]);}
-            dedup_rows(rows,emit);
+#ifdef SHOP_SHORT_IDS
+            flush_links();
+#endif
         });
     }
     template<class R,class Emit> void dedup_rows(std::vector<R>& rows,Emit emit) {

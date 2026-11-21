@@ -71,9 +71,8 @@ public:
         }
         slots[at]={key,value};++used;return {&slots[at],true};
     }
-    Slot* find(const Key& key) {
+    Slot* find(const Key& key,size_t hash) {
         if(slots.empty())return nullptr;
-        size_t hash=Hasher{}(key);
         size_t at=bucket(hash,slots.size()-1);
 #ifdef __SSE2__
         if(!tags.empty())return find_tagged(key,hash,at);
@@ -84,7 +83,15 @@ public:
         }
         return nullptr;
     }
+    Slot* find(const Key& key){return slots.empty()?nullptr:find(key,Hasher{}(key));}
+    const Slot* find(const Key& key,size_t hash)const{return const_cast<FlatMap*>(this)->find(key,hash);}
     const Slot* find(const Key& key)const{return const_cast<FlatMap*>(this)->find(key);}
+    void prefetch(size_t hash)const {
+        if(slots.empty())return;
+        size_t at=bucket(hash,slots.size()-1);
+        if(!tags.empty())__builtin_prefetch(tags.data()+at,0,1);
+        __builtin_prefetch(slots.data()+at,0,1);
+    }
     Slot* end(){return nullptr;}
     const Slot* end()const{return nullptr;}
     template<class F>void each(F f)const{for(auto& [key,value]:slots)if(!empty(key))f(key,value);}

@@ -295,3 +295,10 @@ a bounded count of input lines. The full 20M medians were **1.779 vs. 1.846
 seconds** in the three-pair trial and **1.825 vs. 1.862 seconds** across five
 pairs in the repeat. Each output matched exactly. The earlier link path is
 available with `--legacy-link-input`.
+
+Deduplication now prefetches canonical-user lookups in groups of 16 surviving
+events, then resolves and routes those events. The 20M median fell from
+**1.805 to 1.741 seconds** over five alternating pairs, and every output matched
+the reference. Use `--unbatched-link-probes` to reproduce the previous path.
+The batching experiment follows the general technique described in
+[Improving Hash Join Performance through Prefetching](https://pdl.cmu.edu/PDL-FTP/Database/icde04_abs.shtml).
