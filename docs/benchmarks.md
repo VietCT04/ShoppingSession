@@ -397,3 +397,9 @@ with 16-byte records and **1.381 seconds** with the previous layout. Both
 tables matched the full reference in every run. The new profile-guided binary
 also passed all 36 fixtures, the official dev comparison, and a separate 20M
 run with default settings.
+
+Event validation compares the exact four-byte `view` and `cart` values and
+combines the independent validity and lateness checks. The five-pair repeat
+on the 16-byte dedup layout measured **1.067 vs 1.073 seconds**. The new path
+was faster in four pairs and all ten full 20M outputs matched the reference.
+Use `--conditional-event-validation` to compare the former validation path.

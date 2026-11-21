@@ -141,6 +141,7 @@ struct Options {
     bool raw_arena=true;
     bool mark_duplicate_events=true;
     bool narrow_duplicate_locations=true;
+    bool branchless_event_validation=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -209,6 +210,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--copy-dedup-winners")o.mark_duplicate_events=false;
         else if(arg=="--narrow-duplicate-locations")o.narrow_duplicate_locations=true;
         else if(arg=="--wide-duplicate-locations")o.narrow_duplicate_locations=false;
+        else if(arg=="--branchless-event-validation")o.branchless_event_validation=true;
+        else if(arg=="--conditional-event-validation")o.branchless_event_validation=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -398,6 +401,16 @@ struct Pipeline {
         else Inputs::lines(chunk,[&](SV line){std::array<SV,N> fields;if(csv(line,fields))consume(fields);});
     }
     int64_t parse_time(SV s)const{return o.fast_time?strict_time.parse(s):timestamp(s);}
+    static unsigned classify_event(SV type) {
+        if(type.size()==4) {
+            uint32_t word;
+            std::memcpy(&word,type.data(),4);
+            constexpr auto view=std::bit_cast<uint32_t>(std::array<char,4>{'v','i','e','w'});
+            constexpr auto cart=std::bit_cast<uint32_t>(std::array<char,4>{'c','a','r','t'});
+            return (word==view)|(word==cart);
+        }
+        return type=="purchase"?2:0;
+    }
     template<class R,class Buffer> void parse_events(std::vector<std::vector<Buffer>>& raw) {
         parallel(in.events.size()+size_t(o.overlap_links),o.threads,[&](size_t i,int worker){
             if(o.overlap_links) {
@@ -412,9 +425,17 @@ struct Pipeline {
                 // must never rescue an invalid earliest copy.
                 int64_t ts=parse_time(f[2]),ingest=o.ordered_ingest?IngestOrder::pack(f[3]):parse_time(f[3]);
                 uint64_t price=0;uint32_t category=0;
-                bool purchase=f[4]=="purchase";
-                bool valid=!f[1].empty()&&!f[5].empty()&&(purchase||f[4]=="view"||f[4]=="cart")&&
-                    ts>=start&&ts<end&&(o.ordered_ingest?ingest_order.on_time(ingest,ts):ingest-ts<=DAY);
+                bool purchase,valid;
+                if(o.branchless_event_validation&&!o.ordered_ingest) {
+                    unsigned type=classify_event(f[4]);
+                    purchase=type==2;
+                    bool late=(ingest>ts)&(uint64_t(ingest)-uint64_t(ts)>uint64_t(DAY));
+                    valid=!f[1].empty()&!f[5].empty()&(type!=0)&(ts>=start)&(ts<end)&!late;
+                } else {
+                    purchase=f[4]=="purchase";
+                    valid=!f[1].empty()&&!f[5].empty()&&(purchase||f[4]=="view"||f[4]=="cart")&&
+                        ts>=start&&ts<end&&(o.ordered_ingest?ingest_order.on_time(ingest,ts):ingest-ts<=DAY);
+                }
                 if(purchase) {
                     valid=valid&&digits(f[6],price,10000000)&&price>0;
                     if(valid){auto it=products.find(f[5]);if(it!=products.end())category=it->second;}
