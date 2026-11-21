@@ -56,6 +56,10 @@ struct Event {
     bool operator<(const Event& b)const{return person!=b.person?person<b.person:ts<b.ts;}
 };
 struct Click {Key person,id;int64_t ts;uint32_t campaign;};
+struct RoutedEvent {Key person;uint32_t offset,purchase;};
+struct RoutedClick {Key person,id;uint32_t offset,campaign;};
+static_assert(sizeof(RoutedEvent)==sizeof(Key)+8);
+static_assert(sizeof(RoutedClick)==2*sizeof(Key)+8);
 struct RelativeEvent {
     uint32_t ts,price,category,person;
     bool operator<(const RelativeEvent& other)const{return ts<other.ts;}
@@ -111,6 +115,7 @@ struct Options {
     bool sparse_duplicates=true;
     bool compact_raw=true;
     bool inline_short_links=true;
+    bool packed_routing=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -160,6 +165,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--wide-raw")o.compact_raw=false;
         else if(arg=="--inline-short-links")o.inline_short_links=true;
         else if(arg=="--no-inline-short-links")o.inline_short_links=false;
+        else if(arg=="--packed-routing")o.packed_routing=true;
+        else if(arg=="--wide-routing")o.packed_routing=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -205,6 +212,8 @@ struct Pipeline {
     StrictTimeParser strict_time;
     Workers<Event> events;
     Workers<Click> clicks;
+    Workers<RoutedEvent> routed_events;
+    Workers<RoutedClick> routed_clicks;
     std::vector<CampaignTotals> totals;
     std::vector<std::vector<Aggregate>> dense_totals;
     std::vector<WorkProfile> profiles;
@@ -241,6 +250,12 @@ struct Pipeline {
             std::array<SV,2> f;if(!csv(line,f))throw std::runtime_error("malformed campaigns.csv");
             campaigns.emplace(f[0],campaign_names.size());campaign_names.push_back(f[0]);channels.push_back(f[1]);
         });
+        if(o.packed_routing&&o.direct_encoding&&o.group_person) {
+            if(uint64_t(end-start-1)<=UINT32_MAX&&categories.size()<=256)
+                routed_events.assign(o.threads,Buckets<RoutedEvent>(o.shards));
+            if(uint64_t(end-start-1)+WEEK<=UINT32_MAX)
+                routed_clicks.assign(o.threads,Buckets<RoutedClick>(o.shards));
+        }
         if(o.dense_totals) {
             auto days=dayof(end-1)-dayof(start)+1;
             dense_totals.resize(o.threads);
@@ -357,7 +372,9 @@ struct Pipeline {
                     category=r.category;
                 }
                 Key person=o.overlap_links?canonical(r.person):r.person;
-                events[worker][shard(person)].push_back({person,ts,price,category});
+                size_t destination=shard(person);
+                if(routed_events.empty())events[worker][destination].push_back({person,ts,price,category});
+                else routed_events[worker][destination].push_back({person,uint32_t(ts-start),price|(category<<24)});
             };
             if(o.ingest_shards!=o.dedup_shards) {
                 size_t partitions=o.dedup_shards/o.ingest_shards;
@@ -448,7 +465,11 @@ struct Pipeline {
                 if(f[0].empty()||f[1].empty())return;
                 auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
                 auto ts=parse_time(f[3]);if(ts<start-WEEK||ts>=end)return;
-                auto p=canonical(Key(f[1]));clicks[worker][shard(p)].push_back({p,Key(f[0]),ts,it->second});
+                auto person=canonical(Key(f[1]));
+                size_t destination=shard(person);
+                Key id(f[0]);
+                if(routed_clicks.empty())clicks[worker][destination].push_back({person,id,ts,it->second});
+                else routed_clicks[worker][destination].push_back({person,id,uint32_t(ts-(start-WEEK)),it->second});
             });
         });
         // Identical duplicate clicks need no materialized dedup: they cannot
@@ -470,12 +491,28 @@ struct Pipeline {
             std::vector<T>().swap(records);
         }
     }
+    size_t event_bucket_size(size_t s)const {
+        return routed_events.empty()?bucket_size(events,s):bucket_size(routed_events,s);
+    }
+    size_t click_bucket_size(size_t s)const {
+        return routed_clicks.empty()?bucket_size(clicks,s):bucket_size(routed_clicks,s);
+    }
     template<class E> void encode_shard(size_t shard,int worker,int64_t time_base) {
         auto before=Clock::now();
         if(o.direct_encoding) {
-            auto consume_events=[&](auto f){consume_bucket(events,shard,f);};
-            auto consume_clicks=[&](auto f){consume_bucket(clicks,shard,f);};
-            encode_partition<E>(shard,worker,bucket_size(events,shard),bucket_size(clicks,shard),
+            auto consume_events=[&](auto f) {
+                if(routed_events.empty())consume_bucket(events,shard,f);
+                else consume_bucket(routed_events,shard,[&](const RoutedEvent& e) {
+                    f(Event{e.person,start+e.offset,e.purchase&CompactRaw::price_mask,e.purchase>>24});
+                });
+            };
+            auto consume_clicks=[&](auto f) {
+                if(routed_clicks.empty())consume_bucket(clicks,shard,f);
+                else consume_bucket(routed_clicks,shard,[&](const RoutedClick& c) {
+                    f(Click{c.person,c.id,start-WEEK+c.offset,c.campaign});
+                });
+            };
+            encode_partition<E>(shard,worker,event_bucket_size(shard),click_bucket_size(shard),
                                 consume_events,consume_clicks,time_base,before);
         } else {
             auto event_rows=gather(events,shard);
@@ -494,7 +531,7 @@ struct Pipeline {
             order.reserve(o.shards);
             for(int shard=0;shard<o.shards;++shard) {
                 order.push_back(shard);
-                weights[shard]=bucket_size(events,shard)+bucket_size(clicks,shard);
+                weights[shard]=event_bucket_size(shard)+click_bucket_size(shard);
             }
             std::sort(order.begin(),order.end(),[&](size_t a,size_t b){return weights[a]>weights[b];});
         }

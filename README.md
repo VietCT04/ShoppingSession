@@ -74,7 +74,7 @@ Keep the benchmark input separate from the profile training input.
 
 ```sh
 make pgo PGO_DATA=data/dev
-BINARY_SHORT=build/shopping-pgo CONFIG=row-csv,short-ids ROUND_ROBIN=1 \
+BINARY_SHORT=build/shopping-pgo CONFIG=packed-routing,short-ids ROUND_ROBIN=1 \
   taskset -c 0-7 build/check bench data/practice20 out-practice-baseline 5
 ```
 

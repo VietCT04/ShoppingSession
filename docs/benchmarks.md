@@ -281,3 +281,11 @@ local median so far, **1.403 seconds** for the full 20M input, compared with
 **1.534 seconds** for the standard build in the same five-pair batch. The
 profile used the separate 1M dev input. The faster build matched every large
 reference output, all 36 official fixtures, and the official dev answers.
+
+Packing the records routed to sessionization reduces events from 24 to 16
+bytes and clicks from 32 to 24 bytes on amd64. The 20M median improved from
+**1.910 to 1.838 seconds** across five alternating pairs after enabling the row
+scanner, with a median peak RSS reduction of 131 MiB. Every timed result and a
+separate run using production defaults matched the reference. The fixture
+matrix, dev answers, and fallbacks for long windows and large category tables
+passed. Use `--wide-routing` to compare the previous layout.
