@@ -51,6 +51,20 @@ not replaced the custom flat table. Dedup itself fell to 0.78 seconds in one run
 but unrelated phases also varied substantially; close comparisons need
 alternating control/candidate runs on the same host.
 
+The optional IPS libraries were compared in alternating order, three repeats
+each, using the same binary and dataset. All nine outputs match:
+
+| Large-group sorter | Median seconds |
+| --- | ---: |
+| Existing DuckDB Ska/PDQ components (control) | 4.772 |
+| IPS4o | 4.808 |
+| IPS2Ra, including click-ID tie correction | 4.822 |
+
+The existing backend remains selected. The 4.772-second control is a lower
+observed local median for the same algorithm; it does not establish an algorithmic
+gain over the earlier 4.992-second run. The verified `submit-v1` tag stays frozen
+on main while experiments continue in a separate worktree.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

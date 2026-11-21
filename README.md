@@ -115,6 +115,21 @@ map aggregation for comparison.
 
 ## Submission container
 
+Optional large-group sort experiments:
+
+```sh
+make build/shopping-ips
+ROUND_ROBIN=1 BINARY=build/shopping-ips \
+  CONFIG=person-8-256,person-ips4o-8-256,person-ips2ra-8-256 \
+  build/check bench data/practice20 out-practice-baseline 3
+```
+
+This uses sequential IPS entry points on the pipeline's eight workers, without
+nested worker pools. Optional TBB headers/libraries are extracted into ignored
+`build/vendor/ips/` using the host's APT packages. They are not needed by the
+default binary. A comma-separated CONFIG list plus ROUND_ROBIN=1 alternates
+candidate/control order between repetitions.
+
 ```sh
 make docker
 sh scripts/docker_run.sh data/dev out-container
