@@ -148,6 +148,11 @@ int main(int argc,char** argv) {
             configs.back().flags.push_back("--direct-encoding");
             configs.push_back({"overlap-links",configs.back().flags});
             configs.back().flags.push_back("--overlap-links");
+            const auto overlap_control=configs.back().flags;
+            configs.push_back({"tag-links",overlap_control});
+            configs.back().flags.push_back("--tag-links");
+            configs.push_back({"heavy-shards",overlap_control});
+            configs.back().flags.push_back("--heavy-shards-first");
             configs.push_back({"direct-dedup",narrow_control});
             configs.back().flags.push_back("--direct-dedup");
             configs.push_back({"direct-both",configs.back().flags});

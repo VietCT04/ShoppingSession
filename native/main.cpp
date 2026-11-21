@@ -87,6 +87,7 @@ struct Options {
     bool narrow_events=true;
     bool direct_dedup=false,direct_encoding=true;
     bool overlap_links=true;
+    bool tag_links=false,heavy_shards_first=false;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -123,6 +124,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-direct-encoding")o.direct_encoding=false;
         else if(arg=="--overlap-links")o.overlap_links=true;
         else if(arg=="--no-overlap-links")o.overlap_links=false;
+        else if(arg=="--tag-links")o.tag_links=true;
+        else if(arg=="--heavy-shards-first")o.heavy_shards_first=true;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -216,6 +219,9 @@ struct Pipeline {
             std::array<SV,2> f;if(csv(line,f)&&!f[0].empty()&&!f[1].empty())people.join(f[0],f[1]);
         });
         people.finish();
+#ifdef SHOP_PACKED_IDS
+        if(o.tag_links)people.index.freeze();
+#endif
 #ifndef SHOP_PACKED_IDS
         if(o.flat_links) {
             person_lookup.reserve(people.index.size());
@@ -362,7 +368,18 @@ struct Pipeline {
         }
     }
     void sessionize() {
-        parallel(o.shards,o.threads,[&](size_t s,int worker){
+        std::vector<size_t> order;
+        if(o.heavy_shards_first) {
+            std::vector<size_t> weights(o.shards);
+            order.reserve(o.shards);
+            for(int shard=0;shard<o.shards;++shard) {
+                order.push_back(shard);
+                weights[shard]=bucket_size(events,shard)+bucket_size(clicks,shard);
+            }
+            std::sort(order.begin(),order.end(),[&](size_t a,size_t b){return weights[a]>weights[b];});
+        }
+        parallel(o.shards,o.threads,[&](size_t job,int worker){
+            size_t s=order.empty()?job:order[job];
             if(o.group_person&&o.narrow_events&&uint64_t(end-start-1)<=UINT32_MAX) {
                 encode_shard<RelativeEvent>(s,worker,start);
             } else if(o.compact||o.group_person) {
