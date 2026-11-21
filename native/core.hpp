@@ -13,6 +13,7 @@
 #include <map>
 #include <mutex>
 #include <regex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>

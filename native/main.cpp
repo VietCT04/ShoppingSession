@@ -33,7 +33,17 @@ struct PackedEventSortKey {
     uint64_t operator()(const Event& e)const{return e.person.prefix();}
 };
 #endif
-struct CompactClick {Key id;int64_t ts;uint32_t campaign,person;};
+struct CompactClick {
+    Key id;int64_t ts;uint32_t campaign,person;
+    bool operator<(const CompactClick& b)const{return ts!=b.ts?ts<b.ts:id>b.id;}
+};
+struct TimeSortKey {
+    bool requires_next_sort=false;
+    static constexpr size_t ska_sort_width=8;
+    bool Interrupted()const{return false;}
+    bool ByteIsSkippable(size_t)const{return false;}
+    template<class E>uint64_t operator()(const E& e)const{return uint64_t(e.ts)^0x8000000000000000ULL;}
+};
 struct Aggregate {int64_t sessions=0,purchasing=0,revenue=0,assisted=0;};
 struct WorkProfile {double gather=0,intern=0,sort=0,aggregate=0,parquet=0;};
 using CampaignTotals=std::map<std::pair<int64_t,uint32_t>,Aggregate>;
@@ -51,6 +61,7 @@ struct Options {
 #endif
     bool flat_links=false;
     bool dense_totals=true;
+    bool group_person=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
 };
@@ -68,6 +79,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--flat-links")o.flat_links=true;
         else if(arg=="--dense-totals")o.dense_totals=true;
         else if(arg=="--no-dense-totals")o.dense_totals=false;
+        else if(arg=="--group-person")o.group_person=true;
+        else if(arg=="--no-group-person")o.group_person=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup"&&i+1<argc)o.dedup=argv[++i];
@@ -78,7 +91,7 @@ Options options(int argc,char** argv) {
         else if(positional==2)o.out=arg;
         else throw std::runtime_error("too many paths");
     }
-    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.sorter="std";}
+    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.sorter="std";}
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat")throw std::runtime_error("dedup must be sort, hash, or flat");
     if(o.sorter!="std"&&o.sorter!="duckdb")throw std::runtime_error("sorter must be std or duckdb");
@@ -229,34 +242,74 @@ struct Pipeline {
             auto before=Clock::now();
             auto ev=gather(events,s);auto cl=gather(clicks,s);
             profiles[worker].gather+=elapsed(before);before=Clock::now();
-            if(o.compact) {
+            if(o.compact||o.group_person) {
                 KeyFlatMap<uint32_t> codes;
                 std::vector<Key> names;
+                std::vector<size_t> event_counts;
                 std::vector<CompactEvent> compact_events;compact_events.reserve(ev.size());
                 for(auto& e:ev) {
                     auto [it,added]=codes.try_emplace(e.person,names.size());
-                    if(added)names.push_back(e.person);
+                    if(added){names.push_back(e.person);if(o.group_person)event_counts.push_back(0);}
+                    if(o.group_person)++event_counts[it->second];
                     compact_events.push_back({e.ts,e.price,e.category,it->second});
                 }
                 std::vector<Event>().swap(ev);
                 std::vector<CompactClick> compact_clicks;compact_clicks.reserve(cl.size());
+                std::vector<size_t> click_counts(o.group_person?names.size():0);
                 for(auto& c:cl) {
                     auto it=codes.find(c.person);
-                    if(it!=codes.end())compact_clicks.push_back({c.id,c.ts,c.campaign,it->second});
+                    if(it!=codes.end()){
+                        compact_clicks.push_back({c.id,c.ts,c.campaign,it->second});
+                        if(o.group_person)++click_counts[it->second];
+                    }
                 }
                 std::vector<Click>().swap(cl);
                 profiles[worker].intern+=elapsed(before);
-                process(s,worker,compact_events,compact_clicks,[&](uint32_t code){return names[code];});
-            } else process(s,worker,ev,cl,[](Key person){return person;});
+                if(o.group_person) {
+                    auto group_begin=Clock::now();
+                    auto grouped_events=group_records(compact_events,event_counts);
+                    auto grouped_clicks=group_records(compact_clicks,click_counts);
+                    profiles[worker].gather+=elapsed(group_begin);
+                    auto sort_begin=Clock::now();
+                    for(size_t person=0;person<names.size();++person) {
+                        auto eb=grouped_events.data.get()+event_counts[person],ee=grouped_events.data.get()+event_counts[person+1];
+                        sort_group(eb,ee,[](auto& a,auto& b){return a.ts<b.ts;});
+                        auto cb=grouped_clicks.data.get()+click_counts[person],ce=grouped_clicks.data.get()+click_counts[person+1];
+                        sort_group(cb,ce,[](auto& a,auto& b){return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;});
+                    }
+                    profiles[worker].sort+=elapsed(sort_begin);
+                    process(s,worker,std::span(grouped_events.data.get(),grouped_events.size),std::span(grouped_clicks.data.get(),grouped_clicks.size),[&](uint32_t code){return names[code];},true);
+                } else process(s,worker,std::span(compact_events),std::span(compact_clicks),[&](uint32_t code){return names[code];});
+            } else process(s,worker,std::span(ev),std::span(cl),[](Key person){return person;});
         });
         WorkProfile sum;
         for(auto p:profiles){sum.gather+=p.gather;sum.intern+=p.intern;sum.sort+=p.sort;sum.aggregate+=p.aggregate;sum.parquet+=p.parquet;}
         std::cerr<<"session_work_seconds gather="<<sum.gather<<" intern="<<sum.intern<<" sort="<<sum.sort<<" aggregate="<<sum.aggregate<<" parquet="<<sum.parquet<<'\n';
     }
-    template<class E,class C,class Name> void process(size_t s,int worker,std::vector<E>& ev,std::vector<C>& cl,Name name) {
+    template<class T>struct Grouped {std::unique_ptr<T[]> data;size_t size;};
+    template<class T>static Grouped<T> group_records(std::vector<T>& input,std::vector<size_t>& counts) {
+        size_t sum=0;
+        for(auto& count:counts){auto n=count;count=sum;sum+=n;}
+        counts.push_back(sum);
+        auto positions=counts;
+        // Default-initialize trivial records: avoid an extra zero-fill pass.
+        std::unique_ptr<T[]> output(new T[sum]);
+        for(auto& row:input)output[positions[row.person]++]=row;
+        std::vector<T>().swap(input);
+        return {std::move(output),sum};
+    }
+    template<class T,class Less>static void sort_group(T* begin,T* end,Less less) {
+        size_t n=end-begin;
+        if(n<2)return;
+        if(n<=24) {
+            for(T* i=begin+1;i<end;++i){T value=*i;T* j=i;while(j>begin&&less(value,*(j-1))){*j=*(j-1);--j;}*j=value;}
+        } else if(n<1024)duckdb_pdqsort::pdqsort_branchless(begin,end,less);
+        else duckdb_ska_sort::ska_sort(begin,end,TimeSortKey{std::is_same_v<T,CompactClick>});
+    }
+    template<class E,class C,class Name> void process(size_t s,int worker,std::span<E> ev,std::span<C> cl,Name name,bool pre_sorted=false) {
             auto before=Clock::now();
             auto event_less=[](auto& a,auto& b){return a.person!=b.person?a.person<b.person:a.ts<b.ts;};
-            if(o.sorter=="duckdb") {
+            if(!pre_sorted&&o.sorter=="duckdb") {
                 if constexpr(std::is_same_v<E,CompactEvent>) {
                     duckdb_sort_events(ev,start,end);
                 } else {
@@ -266,11 +319,11 @@ struct Pipeline {
                     duckdb_pdqsort::pdqsort(ev.begin(),ev.end(),event_less);
 #endif
                 }
-            } else std::sort(ev.begin(),ev.end(),event_less);
+            } else if(!pre_sorted)std::sort(ev.begin(),ev.end(),event_less);
             // Within a timestamp, reverse click_id order puts the winning ID last.
             auto click_less=[](auto& a,auto& b){return a.person!=b.person?a.person<b.person:(a.ts!=b.ts?a.ts<b.ts:a.id>b.id);};
-            if(o.sorter=="duckdb")duckdb_pdqsort::pdqsort(cl.begin(),cl.end(),click_less);
-            else std::sort(cl.begin(),cl.end(),click_less);
+            if(!pre_sorted&&o.sorter=="duckdb")duckdb_pdqsort::pdqsort(cl.begin(),cl.end(),click_less);
+            else if(!pre_sorted)std::sort(cl.begin(),cl.end(),click_less);
             profiles[worker].sort+=elapsed(before);before=Clock::now();
             using parquet::Column;
             std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",2},{"events",2},{"revenue_cents",2},{"top_category",6,true}};

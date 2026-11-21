@@ -33,6 +33,16 @@ Every timed output exactly matches the single-thread reference output.
 | Corrected flat-table bucket hash + dense totals | **8.736** |
 | Above + SSE2 CSV special-character scanning | **8.534** |
 | Inline 128-bit IDs, direct sorting, no ID interning | **5.498** |
+| Per-person histograms + timestamp-only local sorting | **4.992** |
+
+The per-person experiment lives on `perf/person-partition`. Its three exact
+20M runs took 4.992, 5.272, and 4.859 seconds. It uses ID encoding, a histogram,
+prefix sums, and scatter to make each person's events/clicks contiguous. Groups
+up to 24 records use insertion sort, medium groups use PDQSort, and large groups
+use radix sorting. Sorting work fell from roughly 5.1–5.3 worker-seconds to 1.2–1.3;
+the histogram/scatter and encoding passes add memory traffic. It is selected as
+the default; `--no-group-person` retains the preceding algorithm. All 396
+fixture/configuration checks and unit tests pass.
 
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep

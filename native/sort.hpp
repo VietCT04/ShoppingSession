@@ -25,7 +25,7 @@ struct EventSortKey {
         return (uint64_t(e.person)<<32)|(requires_next_sort?time>>32:time);
     }
 };
-inline void duckdb_sort_events(std::vector<CompactEvent>& ev,int64_t start,int64_t end) {
+inline void duckdb_sort_events(std::span<CompactEvent> ev,int64_t start,int64_t end) {
     if(ev.size()>1)duckdb_ska_sort::ska_sort(ev.begin(),ev.end(),EventSortKey{start,uint64_t(end-start)>UINT32_MAX});
 }
 }
