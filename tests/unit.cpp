@@ -5,6 +5,7 @@
 #include "../native/csv_scan.hpp"
 #include "../native/ingest_order.hpp"
 #include "../native/sparse_state.hpp"
+#include "../native/fast_time.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <random>
@@ -36,6 +37,27 @@ int main(){try{
     for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
     require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
     std::mt19937_64 rng(938151);
+    {
+        StrictTimeParser parser;parser.init(timestamp("2028-02-20T00:00:00Z"),timestamp("2028-03-05T00:00:00Z"));
+        for(size_t i=0;i<300000;++i) {
+            char value[48];
+            unsigned y=i%3?2027+rng()%3:rng()%10000,m=rng()%15,d=rng()%34,h=rng()%26,mi=rng()%63,sec=rng()%63;
+            if(i%2)std::snprintf(value,sizeof(value),"%04u-%02u-%02uT%02u:%02u:%02uZ",y,m,d,h,mi,sec);
+            else std::snprintf(value,sizeof(value),"%04u-%02u-%02uT%02u:%02u:%02u%c%02u:%02u",y,m,d,h,mi,sec,rng()%2?'+':'-',unsigned(rng()%26),unsigned(rng()%63));
+            std::string input=value;
+            if(i%4==0)input[rng()%input.size()]=char(rng()%256);
+            require(parser.parse(input)==timestamp(input),"strict cached ISO parser equals general parser");
+            std::string epoch=std::to_string(rng()&INT64_MAX);
+            if(i%3==0)epoch.insert(0,rng()%25,'0');
+            if(i%5==0)epoch[rng()%epoch.size()]=char(rng()%256);
+            require(parser.parse(epoch)==timestamp(epoch),"SWAR epoch parser equals general parser");
+        }
+        for(size_t i=0;i<100000;++i) {
+            char eight[9];unsigned n=rng()%100000000;
+            std::snprintf(eight,sizeof(eight),"%08u",n);
+            require(StrictTimeParser::eight_digits(eight)&&StrictTimeParser::decimal8(eight)==n,"eight-digit conversion");
+        }
+    }
     {
         CampaignWindow window(257);std::vector<size_t> counts(257);
         for(size_t i=0;i<100000;++i) {

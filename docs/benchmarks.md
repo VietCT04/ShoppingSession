@@ -120,6 +120,14 @@ original algorithms. All 648 fixture/configuration checks, official dev answers,
 and randomized multiplicity/reset/tie tests pass. Large host timing variation
 remains visible; these are local comparisons, not leaderboard scores.
 
+The strict timestamp parser caches calendar dates around the manifest window
+and processes eight validated decimal digits at once for epoch timestamps.
+Five alternating 20M trials gave medians of **4.104 s** for the new parser and
+4.728 s for the control. The previous best control median on this host was
+4.167 s. Both parsers matched the reference on every trial. The production
+entrypoint also matched the official 1M answers and the 20M reference.
+Use `--no-fast-time` to reproduce the generic parser path.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

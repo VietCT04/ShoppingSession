@@ -6,6 +6,7 @@
 #include "csv_scan.hpp"
 #include "ingest_order.hpp"
 #include "sparse_state.hpp"
+#include "fast_time.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
 #ifdef SHOP_IPS_SORTS
 #include "ips4o.hpp"
@@ -77,6 +78,7 @@ struct Options {
     bool fused_csv=true;
     bool ordered_ingest=false;
     bool array_active=true,array_categories=true;
+    bool fast_time=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -104,6 +106,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--array-categories")o.array_categories=true;
         else if(arg=="--no-array-active")o.array_active=false;
         else if(arg=="--no-array-categories")o.array_categories=false;
+        else if(arg=="--fast-time")o.fast_time=true;
+        else if(arg=="--no-fast-time")o.fast_time=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -118,6 +122,7 @@ Options options(int argc,char** argv) {
     }
     if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.fused_csv=false;o.ordered_ingest=false;o.array_active=false;o.array_categories=false;o.sorter="std";}
     if(!o.dedup_shards||o.baseline)o.dedup_shards=o.shards;
+    if(o.baseline)o.fast_time=false;
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup_shards<1||o.dedup_shards>16384||(o.dedup_shards&(o.dedup_shards-1)))throw std::runtime_error("dedup-shards must be a power of two in 1..16384");
     if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat"&&o.dedup!="dense")throw std::runtime_error("dedup must be sort, hash, flat, or dense");
@@ -137,6 +142,7 @@ struct Pipeline {
     std::vector<SV> categories={"unknown"},campaign_names={"organic"},channels={"organic"};
     int64_t start,end;
     IngestOrder ingest_order;
+    StrictTimeParser strict_time;
     Workers<Raw> raw;
     Workers<Event> events;
     Workers<Click> clicks;
@@ -161,6 +167,7 @@ struct Pipeline {
         start=window("window_start");end=window("window_end");
         if(start<0||end<=start)throw std::runtime_error("invalid manifest window");
         if(o.ordered_ingest)ingest_order.init(start,end);
+        if(o.fast_time)strict_time.init(start,end);
         std::vector<Chunk> lookup;
         in.add(o.data/"products.csv",lookup);
         category_index.emplace("unknown",0);
@@ -218,13 +225,14 @@ struct Pipeline {
         if(o.fused_csv)scan_csv<N>(chunk,consume);
         else Inputs::lines(chunk,[&](SV line){std::array<SV,N> fields;if(csv(line,fields))consume(fields);});
     }
+    int64_t parse_time(SV s)const{return o.fast_time?strict_time.parse(s):timestamp(s);}
     void parse_events() {
         parallel(in.events.size(),o.threads,[&](size_t i,int worker){
             records<7>(in.events[i],[&](const std::array<SV,7>& f){
                 if(f[0].empty())return;
                 // Invalid winners remain in the dedup input. A later valid copy
                 // must never rescue an invalid earliest copy.
-                int64_t ts=timestamp(f[2]),ingest=o.ordered_ingest?IngestOrder::pack(f[3]):timestamp(f[3]);
+                int64_t ts=parse_time(f[2]),ingest=o.ordered_ingest?IngestOrder::pack(f[3]):parse_time(f[3]);
                 uint64_t price=0;uint32_t category=0;
                 bool purchase=f[4]=="purchase";
                 bool valid=!f[1].empty()&&!f[5].empty()&&(purchase||f[4]=="view"||f[4]=="cart")&&
@@ -269,7 +277,7 @@ struct Pipeline {
             records<4>(in.clicks[i],[&](const std::array<SV,4>& f){
                 if(f[0].empty()||f[1].empty())return;
                 auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
-                auto ts=timestamp(f[3]);if(ts<start-WEEK||ts>=end)return;
+                auto ts=parse_time(f[3]);if(ts<start-WEEK||ts>=end)return;
                 auto p=canonical(Key(f[1]));clicks[worker][shard(p)].push_back({p,Key(f[0]),ts,it->second});
             });
         });
