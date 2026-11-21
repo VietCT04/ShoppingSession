@@ -85,6 +85,7 @@ struct Options {
     bool array_active=true,array_categories=true;
     bool fast_time=true;
     bool narrow_events=true;
+    bool single_session=false, flat_lookups=false;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -116,6 +117,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-fast-time")o.fast_time=false;
         else if(arg=="--narrow-events")o.narrow_events=true;
         else if(arg=="--wide-events")o.narrow_events=false;
+        else if(arg=="--single-session")o.single_session=true;
+        else if(arg=="--flat-lookups")o.flat_lookups=true;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -147,6 +150,7 @@ struct Pipeline {
     PeopleType people;
     KeyFlatMap<uint32_t> person_lookup;
     Dict<uint32_t> products,campaigns,category_index;
+    FlatMap<uint32_t> flat_products,flat_campaigns;
     std::vector<SV> categories={"unknown"},campaign_names={"organic"},channels={"organic"};
     int64_t start,end;
     IngestOrder ingest_order;
@@ -183,12 +187,15 @@ struct Pipeline {
             std::array<SV,2> f;if(!csv(line,f))throw std::runtime_error("malformed products.csv");
             auto [it,added]=category_index.try_emplace(f[1],categories.size());
             if(added)categories.push_back(f[1]);
-            products.emplace(f[0],it->second);
+            if(o.flat_lookups)flat_products.try_emplace(f[0],it->second);
+            else products.emplace(f[0],it->second);
         });
         lookup.clear();in.add(o.data/"campaigns.csv",lookup);
         for(auto chunk:lookup)Inputs::lines(chunk,[&](SV line){
             std::array<SV,2> f;if(!csv(line,f))throw std::runtime_error("malformed campaigns.csv");
-            campaigns.emplace(f[0],campaign_names.size());campaign_names.push_back(f[0]);channels.push_back(f[1]);
+            if(o.flat_lookups)flat_campaigns.try_emplace(f[0],campaign_names.size());
+            else campaigns.emplace(f[0],campaign_names.size());
+            campaign_names.push_back(f[0]);channels.push_back(f[1]);
         });
         if(o.dense_totals) {
             auto days=dayof(end-1)-dayof(start)+1;
@@ -234,6 +241,14 @@ struct Pipeline {
         else Inputs::lines(chunk,[&](SV line){std::array<SV,N> fields;if(csv(line,fields))consume(fields);});
     }
     int64_t parse_time(SV s)const{return o.fast_time?strict_time.parse(s):timestamp(s);}
+    uint32_t lookup(SV key,const Dict<uint32_t>& nodes,const FlatMap<uint32_t>& flat)const {
+        if(o.flat_lookups) {
+            auto entry=flat.find(key);
+            return entry?entry->second:0;
+        }
+        auto entry=nodes.find(key);
+        return entry!=nodes.end()?entry->second:0;
+    }
     void parse_events() {
         parallel(in.events.size(),o.threads,[&](size_t i,int worker){
             records<7>(in.events[i],[&](const std::array<SV,7>& f){
@@ -247,7 +262,7 @@ struct Pipeline {
                     ts>=start&&ts<end&&(o.ordered_ingest?ingest_order.on_time(ingest,ts):ingest-ts<=DAY);
                 if(purchase) {
                     valid=valid&&digits(f[6],price,10000000)&&price>0;
-                    if(valid){auto it=products.find(f[5]);if(it!=products.end())category=it->second;}
+                    if(valid)category=lookup(f[5],products,flat_products);
                 }
                 if(!valid)ts=-1;
                 Key event_id(f[0]);
@@ -284,9 +299,10 @@ struct Pipeline {
         parallel(in.clicks.size(),o.threads,[&](size_t i,int worker){
             records<4>(in.clicks[i],[&](const std::array<SV,4>& f){
                 if(f[0].empty()||f[1].empty())return;
-                auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
+                uint32_t campaign=lookup(f[2],campaigns,flat_campaigns);
+                if(!campaign)return;
                 auto ts=parse_time(f[3]);if(ts<start-WEEK||ts>=end)return;
-                auto p=canonical(Key(f[1]));clicks[worker][shard(p)].push_back({p,Key(f[0]),ts,it->second});
+                auto p=canonical(Key(f[1]));clicks[worker][shard(p)].push_back({p,Key(f[0]),ts,campaign});
             });
         });
         // Identical duplicate clicks need no materialized dedup: they cannot
@@ -341,17 +357,31 @@ struct Pipeline {
             auto grouped_clicks=group_records(compact_clicks,click_counts);
             profiles[worker].gather+=elapsed(group_begin);
             auto sort_begin=Clock::now();
+            std::vector<uint8_t> single_sessions(o.single_session?names.size():0);
             for(size_t person=0;person<names.size();++person) {
                 auto eb=grouped_events.data.get()+event_counts[person],ee=grouped_events.data.get()+event_counts[person+1];
-                sort_group(eb,ee,[](auto& a,auto& b){return a.ts<b.ts;});
+                if(o.single_session&&start_single_session(eb,ee))single_sessions[person]=1;
+                else sort_group(eb,ee,[](auto& a,auto& b){return a.ts<b.ts;});
                 auto cb=grouped_clicks.data.get()+click_counts[person],ce=grouped_clicks.data.get()+click_counts[person+1];
                 sort_group(cb,ce,[](auto& a,auto& b){return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;});
             }
             profiles[worker].sort+=elapsed(sort_begin);
-            process<true>(s,worker,std::span(grouped_events.data.get(),grouped_events.size),std::span(grouped_clicks.data.get(),grouped_clicks.size),[&](uint32_t code){return names[code];},time_base);
+            process<true>(s,worker,std::span(grouped_events.data.get(),grouped_events.size),std::span(grouped_clicks.data.get(),grouped_clicks.size),[&](uint32_t code){return names[code];},time_base,single_sessions);
         } else if constexpr(std::is_same_v<E,CompactEvent>) {
             process(s,worker,std::span(compact_events),std::span(compact_clicks),[&](uint32_t code){return names[code];});
         }
+    }
+    template<class E> static bool start_single_session(E* begin,E* end) {
+        auto earliest=begin;
+        auto latest=begin->ts;
+        for(auto event=begin+1;event<end;++event) {
+            if(event->ts<earliest->ts)earliest=event;
+            else latest=std::max(latest,event->ts);
+            if(int64_t(latest)-int64_t(earliest->ts)>GAP)return false;
+        }
+        // The remaining events need no particular order within the session.
+        if(earliest!=begin)std::iter_swap(begin,earliest);
+        return true;
     }
     template<class T>struct Grouped {std::unique_ptr<T[]> data;size_t size;};
     template<class T>static Grouped<T> group_records(std::vector<T>& input,std::vector<size_t>& counts) {
@@ -384,7 +414,7 @@ struct Pipeline {
             duckdb_ska_sort::ska_sort(begin,end,TimeSortKey{std::is_same_v<T,CompactClick>});
         }
     }
-    template<bool pre_sorted=false,class E,class C,class Name> void process(size_t s,int worker,std::span<E> ev,std::span<C> cl,Name name,int64_t time_base=0) {
+    template<bool pre_sorted=false,class E,class C,class Name> void process(size_t s,int worker,std::span<E> ev,std::span<C> cl,Name name,int64_t time_base=0,std::span<const uint8_t> single_sessions={}) {
             auto before=Clock::now();
             if constexpr(!pre_sorted) {
             auto event_less=[](auto& a,auto& b){return a.person!=b.person?a.person<b.person:a.ts<b.ts;};
@@ -413,6 +443,8 @@ struct Pipeline {
             for(size_t begin=0;begin<ev.size();) {
                 size_t finish=begin+1;auto person_key=ev[begin].person;auto person_name=name(person_key);SV person=text(person_name);
                 while(finish<ev.size()&&ev[finish].person==person_key)++finish;
+                bool single=false;
+                if constexpr(pre_sorted)single=!single_sessions.empty()&&single_sessions[person_key];
                 while(cb<cl.size()&&cl[cb].person<person_key)++cb;
                 size_t ce=cb;while(ce<cl.size()&&cl[ce].person==person_key)++ce;
                 size_t hi=cb,lo=cb;
@@ -433,7 +465,11 @@ struct Pipeline {
                 for(size_t i=begin;i<finish;) {
                     const int64_t st=time_base+ev[i].ts,sd=dayof(st);
                     if(sd!=day){flush();day=sd;}
-                    size_t j=i+1;while(j<finish&&ev[j].ts-ev[j-1].ts<=GAP)++j;
+                    size_t j=finish;
+                    if(!single) {
+                        j=i+1;
+                        while(j<finish&&ev[j].ts-ev[j-1].ts<=GAP)++j;
+                    }
                     int64_t revenue=0;
                     for(size_t k=i;k<j;++k)if(ev[k].price){
                         revenue+=ev[k].price;

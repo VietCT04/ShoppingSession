@@ -143,6 +143,13 @@ int main(int argc,char** argv) {
             configs.push_back({"array-both",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-active","--array-categories"}});
             configs.push_back({"strict-time",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-active","--array-categories","--fast-time"}});
             configs.push_back({"narrow-events",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-active","--array-categories","--fast-time","--narrow-events"}});
+            const auto narrow_control=configs.back().flags;
+            configs.push_back({"single-session",narrow_control});
+            configs.back().flags.push_back("--single-session");
+            configs.push_back({"flat-lookups",narrow_control});
+            configs.back().flags.push_back("--flat-lookups");
+            configs.push_back({"single-session-flat",configs.back().flags});
+            configs.back().flags.push_back("--single-session");
             auto requested_binary=std::getenv("BINARY");
             if(!requested_binary||std::string(requested_binary).find("-ips")==std::string::npos)
                 configs.erase(std::remove_if(configs.begin(),configs.end(),[](const auto& c){return c.name.find("-ips")!=std::string::npos;}),configs.end());
