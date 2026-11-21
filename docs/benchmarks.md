@@ -266,3 +266,12 @@ two batches. The trained and ordinary builds took **1.498 vs. 1.570 seconds**
 in the first batch and **1.898 vs. 2.004 seconds** in the second. Both builds
 produced exact results on every run. The trained executable also passed the
 36 official fixtures and the dev answers. Build it with `make pgo PGO_DATA=data/dev`.
+
+Row-wise AVX2 parsing uses BMI2 bit extraction to match opening and closing
+quotes in short event and click records. Long rows and CPUs without fast BMI2
+use the existing scanners. The new and previous parsers took **1.900 vs. 2.031
+seconds** in one five-pair batch and **1.547 vs. 1.588 seconds** in a second.
+All 20 timed outputs, the default 20M run, and the official dev results
+matched exactly. All 684 fixture/configuration checks and the randomized CSV
+checks passed. The row scanner is selected automatically when supported.
+`--no-row-csv` selects the previous scanner for comparison.

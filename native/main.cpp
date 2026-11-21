@@ -106,7 +106,7 @@ struct Options {
     bool narrow_events=true;
     bool direct_dedup=false,direct_encoding=true;
     bool overlap_links=true;
-    bool avx2_csv=true;
+    bool avx2_csv=true,row_csv=true;
     bool tag_links=true,heavy_shards_first=false;
     bool sparse_duplicates=true;
     bool compact_raw=true;
@@ -148,6 +148,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--overlap-links")o.overlap_links=true;
         else if(arg=="--no-overlap-links")o.overlap_links=false;
         else if(arg=="--avx2-csv")o.avx2_csv=true;
+        else if(arg=="--row-csv")o.row_csv=true;
+        else if(arg=="--no-row-csv")o.row_csv=false;
         else if(arg=="--no-avx2-csv")o.avx2_csv=false;
         else if(arg=="--tag-links")o.tag_links=true;
         else if(arg=="--no-tag-links")o.tag_links=false;
@@ -291,7 +293,8 @@ struct Pipeline {
     template<size_t N,class F>void records(Chunk chunk,F consume)const {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
         if(o.fused_csv&&o.avx2_csv&&avx2_csv_available()) {
-            scan_csv_avx2<N>(chunk,consume);
+            if(o.row_csv&&row_csv_available())scan_csv_rows<N>(chunk,consume);
+            else scan_csv_avx2<N>(chunk,consume);
             return;
         }
 #endif

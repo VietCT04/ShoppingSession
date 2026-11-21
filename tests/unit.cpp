@@ -130,7 +130,7 @@ int main(){try{
             std::string record;
             for(size_t field=0;field<7;++field) {
                 if(field)record+=',';
-                bool quoted=rng()%2;
+                bool quoted=(row%2==0)&&rng()%2;
                 if(quoted)record+='"';
                 for(size_t j=0,n=rng()%30;j<n;++j)record+="abXYZ012 \t\r"[rng()%11];
                 if(quoted)record+='"';
@@ -149,6 +149,11 @@ int main(){try{
             actual.clear();
             scan_csv_avx2<7>(chunk,[&](const std::array<SV,7>& f){actual.push_back(f);});
             require(expected==actual,"AVX2 CSV equals line/scalar parsing");
+            if(row_csv_available()) {
+                actual.clear();
+                scan_csv_rows<7>(chunk,[&](const std::array<SV,7>& f){actual.push_back(f);});
+                require(expected==actual,"AVX2 row CSV equals line/scalar parsing");
+            }
         }
 #endif
     }
