@@ -118,27 +118,38 @@ int main(int argc,char** argv) {
             configs.push_back({"packed-8-256",{"--threads","8","--shards","256","--dedup","flat","--sorter","duckdb","--no-compact","--dense-totals"}});
             configs.push_back({"person-8-256",{"--threads","8","--shards","256","--dedup","flat","--sorter","duckdb","--group-person","--dense-totals"}});
             configs.push_back({"person-dense-8-256",{"--threads","8","--shards","256","--dedup","dense","--sorter","duckdb","--group-person","--dense-totals"}});
+            configs.push_back({"person-ips4o-8-256",{"--threads","8","--shards","256","--dedup","flat","--group-person","--dense-totals","--group-sort","ips4o"}});
+            configs.push_back({"person-ips2ra-8-256",{"--threads","8","--shards","256","--dedup","flat","--group-person","--dense-totals","--group-sort","ips2ra"}});
             // SKIP_BASELINE is useful when timing large datasets against a
             // previously computed oracle. Correctness remains mandatory.
             if(std::getenv("SKIP_BASELINE"))configs.erase(configs.begin());
-            if(auto filter=std::getenv("CONFIG"))configs.erase(std::remove_if(configs.begin(),configs.end(),[&](const auto& c){return c.name!=filter;}),configs.end());
+            if(auto filter=std::getenv("CONFIG")) {
+                auto wanted=","+std::string(filter)+",";
+                configs.erase(std::remove_if(configs.begin(),configs.end(),[&](const auto& c){return wanted.find(","+c.name+",")==std::string::npos;}),configs.end());
+            }
             if(configs.empty())throw std::runtime_error("CONFIG did not match a benchmark configuration");
             std::ofstream results("benchmarks/runs.jsonl",std::ios::app);
-            for(auto config:configs) {
-                std::vector<double> times;
-                for(int i=0;i<repeats;++i) {
+            std::vector<std::vector<double>> times(configs.size());
+            auto measure=[&](size_t index,int i) {
+                    auto& config=configs[index];
                     const char* binary=std::getenv("BINARY");
                     std::vector<std::string> args={binary?binary:"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
                     // Matrix entries start from fixed defaults rather than the
                     // tuned production defaults. Explicit flags override these.
                     args.insert(args.begin()+3,{"--no-compact","--no-group-person","--no-dense-totals","--sorter","std"});
                     auto log=fs::path("benchmarks")/(config.name+"-"+std::to_string(i)+".log");
-                    auto r=run(args,log);compare(db,out,argv[3]);times.push_back(r.seconds);
+                    auto r=run(args,log);compare(db,out,argv[3]);times[index].push_back(r.seconds);
                     auto timestamp=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                    results<<"{\"config\":"<<json_string(config.name)<<",\"dataset\":"<<json_string(argv[2])<<",\"timestamp\":"<<timestamp<<",\"repeat\":"<<i<<",\"seconds\":"<<std::setprecision(9)<<r.seconds<<",\"peak_rss_kib\":"<<r.rss<<",\"correct\":true}\n";results.flush();
+                    results<<"{\"config\":"<<json_string(config.name)<<",\"binary\":"<<json_string(args[0])<<",\"dataset\":"<<json_string(argv[2])<<",\"timestamp\":"<<timestamp<<",\"repeat\":"<<i<<",\"seconds\":"<<std::setprecision(9)<<r.seconds<<",\"peak_rss_kib\":"<<r.rss<<",\"correct\":true}\n";results.flush();
                     std::cout<<config.name<<" "<<i<<" "<<r.seconds<<"s "<<r.rss/1024.0<<" MiB MATCH\n"<<std::flush;
-                }
-                std::sort(times.begin(),times.end());std::cout<<"MEDIAN "<<config.name<<" "<<times[times.size()/2]<<"s\n";
+            };
+            if(std::getenv("ROUND_ROBIN")) {
+                for(int i=0;i<repeats;++i)for(size_t c=0;c<configs.size();++c)measure(i%2?configs.size()-1-c:c,i);
+            } else {
+                for(size_t c=0;c<configs.size();++c)for(int i=0;i<repeats;++i)measure(c,i);
+            }
+            for(size_t c=0;c<configs.size();++c) {
+                auto& t=times[c];std::sort(t.begin(),t.end());std::cout<<"MEDIAN "<<configs[c].name<<" "<<t[t.size()/2]<<"s\n";
             }
         } else throw std::runtime_error("invalid arguments");
     }catch(const std::exception& e){std::cerr<<"check: "<<e.what()<<'\n';return 1;}

@@ -4,6 +4,10 @@
 #include "sort.hpp"
 #include "id.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
+#ifdef SHOP_IPS_SORTS
+#include "ips4o.hpp"
+#include "ips2ra.hpp"
+#endif
 #include <cstdlib>
 #ifndef SHOP_VIEW_IDS
 #define SHOP_PACKED_IDS
@@ -69,6 +73,7 @@ struct Options {
     bool group_person=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
+    std::string group_sort="duckdb";
 };
 Options options(int argc,char** argv) {
     Options o;
@@ -90,6 +95,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup"&&i+1<argc)o.dedup=argv[++i];
         else if(arg=="--sorter"&&i+1<argc)o.sorter=argv[++i];
+        else if(arg=="--group-sort"&&i+1<argc)o.group_sort=argv[++i];
         else if(arg=="--help") {std::cout<<"shopping [DATA OUTPUT] [--baseline] [--threads N] [--shards N] [--dedup sort|hash|flat] [--compact|--no-compact] [--sorter std|duckdb]\n";std::exit(0);}
         else if(arg.starts_with("--"))throw std::runtime_error("unknown option "+arg);
         else if(positional++==0)o.data=arg;
@@ -100,6 +106,10 @@ Options options(int argc,char** argv) {
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat"&&o.dedup!="dense")throw std::runtime_error("dedup must be sort, hash, flat, or dense");
     if(o.sorter!="std"&&o.sorter!="duckdb")throw std::runtime_error("sorter must be std or duckdb");
+    if(o.group_sort!="duckdb"&&o.group_sort!="ips4o"&&o.group_sort!="ips2ra")throw std::runtime_error("group-sort must be duckdb, ips4o, or ips2ra");
+#ifndef SHOP_IPS_SORTS
+    if(o.group_sort!="duckdb")throw std::runtime_error("IPS experiments require make build/shopping-ips");
+#endif
     return o;
 }
 struct Pipeline {
@@ -307,13 +317,24 @@ struct Pipeline {
         std::vector<T>().swap(input);
         return {std::move(output),sum};
     }
-    template<class T,class Less>static void sort_group(T* begin,T* end,Less less) {
+    template<class T,class Less>void sort_group(T* begin,T* end,Less less) {
         size_t n=end-begin;
         if(n<2)return;
         if(n<=24) {
             for(T* i=begin+1;i<end;++i){T value=*i;T* j=i;while(j>begin&&less(value,*(j-1))){*j=*(j-1);--j;}*j=value;}
         } else if(n<1024)duckdb_pdqsort::pdqsort_branchless(begin,end,less);
-        else duckdb_ska_sort::ska_sort(begin,end,TimeSortKey{std::is_same_v<T,CompactClick>});
+        else {
+#ifdef SHOP_IPS_SORTS
+            if(o.group_sort=="ips4o")ips4o::sort(begin,end,less);
+            else if(o.group_sort=="ips2ra") {
+                ips2ra::sort(begin,end,TimeSortKey{});
+                if constexpr(std::is_same_v<T,CompactClick>) {
+                    for(T* b=begin;b<end;){T* e=b+1;while(e<end&&e->ts==b->ts)++e;if(e-b>1)duckdb_pdqsort::pdqsort(b,e,less);b=e;}
+                }
+            } else
+#endif
+            duckdb_ska_sort::ska_sort(begin,end,TimeSortKey{std::is_same_v<T,CompactClick>});
+        }
     }
     template<class E,class C,class Name> void process(size_t s,int worker,std::span<E> ev,std::span<C> cl,Name name,bool pre_sorted=false) {
             auto before=Clock::now();
