@@ -416,3 +416,11 @@ timestamp formats use the existing parser. Two five-pair runs measured
 **1.361 vs 1.403 seconds** and **1.016 vs 1.021 seconds**. Event parsing used
 about 6% less CPU in the first batch, and every full 20M output matched.
 Use `--no-cache-utc-days` to compare the previous parser.
+
+With the UTC date cache enabled, the GCC profile-guided build measured a
+**0.978-second** median over five pinned 20M runs, with a fastest run of
+**0.948 seconds**. The ordinary build measured **1.051 seconds** in the
+same alternating batch. Every output matched the reference, and the
+profile-guided binary passed all 36 fixtures, the official dev comparison,
+and a separate default-settings 20M run. This observed median is within
+normal run-to-run variation of the earlier 0.979-second result.
