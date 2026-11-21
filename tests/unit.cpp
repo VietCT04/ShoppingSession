@@ -7,12 +7,23 @@
 #include "../native/ingest_order.hpp"
 #include "../native/sparse_state.hpp"
 #include "../native/fast_time.hpp"
+#include "../native/ingest_arena.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <random>
 using namespace shop;
 void require(bool v,const char* label){if(!v)throw std::runtime_error(label);}
 int main(){try{
+    {
+        std::array<uint64_t,2> storage;
+        ArenaBucket<uint64_t> bucket(storage.data(),storage.size());
+        for(uint64_t value:{1,2,3,4})bucket.push_back(value);
+        require(std::vector<uint64_t>(bucket.begin(),bucket.end())==std::vector<uint64_t>{1,2,3,4},
+                "arena overflow preserves all raw rows");
+        bucket.release();
+        bucket.push_back(9);
+        require(bucket.size()==1&&*bucket.begin()==9,"arena bucket can reuse its original range");
+    }
     std::array<SV,2> fields;
     require(csv("\" a\",\"b \"",fields)&&fields[0]==" a"&&fields[1]=="b ","quoted spaces");
     require(csv("a,b\r",fields)&&fields[1]=="b\r","CR preserved");

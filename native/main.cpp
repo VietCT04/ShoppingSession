@@ -6,6 +6,7 @@
 #include "short_id.hpp"
 #include "csv_scan.hpp"
 #include "ingest_order.hpp"
+#include "ingest_arena.hpp"
 #include "sparse_state.hpp"
 #include "fast_time.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
@@ -132,6 +133,7 @@ struct Options {
     bool narrow_count_columns=true;
     bool redirect_linked_groups=true;
     bool specialize_aggregation=true;
+    bool raw_arena=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -194,6 +196,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-redirect-linked-groups")o.redirect_linked_groups=false;
         else if(arg=="--specialize-aggregation")o.specialize_aggregation=true;
         else if(arg=="--generic-aggregation")o.specialize_aggregation=false;
+        else if(arg=="--raw-arena")o.raw_arena=true;
+        else if(arg=="--vector-raw")o.raw_arena=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -382,7 +386,7 @@ struct Pipeline {
         else Inputs::lines(chunk,[&](SV line){std::array<SV,N> fields;if(csv(line,fields))consume(fields);});
     }
     int64_t parse_time(SV s)const{return o.fast_time?strict_time.parse(s):timestamp(s);}
-    template<class R> void parse_events(Workers<R>& raw) {
+    template<class R,class Buffer> void parse_events(std::vector<std::vector<Buffer>>& raw) {
         parallel(in.events.size()+size_t(o.overlap_links),o.threads,[&](size_t i,int worker){
             if(o.overlap_links) {
                 // This job owns the link graph. The other jobs carry raw user
@@ -418,7 +422,11 @@ struct Pipeline {
             });
         });
     }
-    template<class R> void dedup(Workers<R>& raw) {
+    template<class Buffer>static void release_raw(Buffer& buffer) {
+        if constexpr(requires {buffer.release();})buffer.release();
+        else Buffer().swap(buffer);
+    }
+    template<class R,class Buffer> void dedup(std::vector<std::vector<Buffer>>& raw) {
         parallel(o.ingest_shards,o.threads,[&](size_t s,int worker){
             size_t count=0;for(auto& w:raw)count+=w[s].size();
             if(!count)return;
@@ -480,7 +488,7 @@ struct Pipeline {
                         size_t subpartition=event_shard(row.id)>>bits;
                         subpartitions[subpartition].push_back(row);
                     }
-                    std::vector<R>().swap(buckets[s]);
+                    release_raw(buckets[s]);
                 }
                 for(auto& rows:subpartitions)if(!rows.empty())dedup_rows(rows,emit);
             } else if(o.direct_dedup&&o.dedup=="flat") {
@@ -493,10 +501,10 @@ struct Pipeline {
                     }
                 }
                 winners.each([&](const Key&,const R* event){emit(*event);});
-                for(auto& buckets:raw)std::vector<R>().swap(buckets[s]);
+                for(auto& buckets:raw)release_raw(buckets[s]);
             } else {
                 std::vector<R> rows;rows.reserve(count);
-                for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<R>().swap(w[s]);}
+                for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());release_raw(w[s]);}
                 dedup_rows(rows,emit);
             }
 #ifdef SHOP_SHORT_IDS
@@ -953,11 +961,22 @@ struct Pipeline {
         parquet::write((o.out/"campaign_daily"/"part-0.parquet").string(),cols);
     }
     template<class R> void ingest_and_dedup(Timer& timer) {
+        auto process_raw=[&](auto& raw) {
+            parse_events<R>(raw);
+            timer.mark(o.overlap_links?"parse_events_and_links":"parse_events");
+            dedup<R>(raw);
+            timer.mark("dedup");
+        };
+        if(o.raw_arena&&!o.baseline&&!in.events.empty()) {
+            size_t bytes=0;
+            for(auto chunk:in.events)bytes+=chunk.end-chunk.begin;
+            std::unique_ptr<IngestArena<R>> arena;
+            try {arena=std::make_unique<IngestArena<R>>(o.threads,o.ingest_shards,bytes);}
+            catch(const std::bad_alloc&) {} // Keep the ordinary allocation path available.
+            if(arena){process_raw(arena->buckets);return;}
+        }
         Workers<R> raw(o.threads,Buckets<R>(o.ingest_shards));
-        parse_events(raw);
-        timer.mark(o.overlap_links?"parse_events_and_links":"parse_events");
-        dedup(raw);
-        timer.mark("dedup");
+        process_raw(raw);
     }
     void run(){
         Timer t(o.threads);
