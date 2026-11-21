@@ -364,3 +364,8 @@ touch pages as workers append rows. A full partition can grow into a vector.
 The five-pair repeat improved from **1.554 to 1.506 seconds** at 20M, and peak
 RSS was about 2,842 MiB in every candidate run. All outputs matched exactly.
 Use `--vector-raw` to compare ordinary partition vectors.
+
+With reserved raw partitions, the profile-guided production build measured
+an exact **1.108-second** median over five pinned 20M runs. The ordinary build
+measured **1.176 seconds** in the same alternating batch. The separate official
+dev workload supplied the profile counters.
