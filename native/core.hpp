@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -22,6 +23,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 
 namespace shop {
 namespace fs=std::filesystem;
@@ -66,7 +70,7 @@ inline std::vector<fs::path> files(const fs::path& dir) {
     std::sort(r.begin(),r.end()); return r;
 }
 // Only LF ends a record. Every comma separates fields. Whole-field quotes only.
-template<size_t N> bool csv(SV line,std::array<SV,N>& f) {
+template<size_t N> bool csv_reference(SV line,std::array<SV,N>& f) {
     size_t start=0;
     for(size_t i=0;i<N;++i) {
         size_t end=line.find(',',start);
@@ -81,6 +85,34 @@ template<size_t N> bool csv(SV line,std::array<SV,N>& f) {
         f[i]=v;start=end+1;
     }
     return true;
+}
+template<size_t N> bool csv(SV line,std::array<SV,N>& fields) {
+#if defined(__SSE2__) && !defined(SHOP_SCALAR_CSV)
+    size_t field=0,start=0;unsigned quotes=0;
+    auto finish=[&](size_t end) {
+        SV value=line.substr(start,end-start);
+        if(quotes) {
+            if(quotes!=2||value.size()<2||value.front()!='"'||value.back()!='"')return false;
+            value.remove_prefix(1);value.remove_suffix(1);
+        }
+        fields[field++]=value;start=end+1;quotes=0;return true;
+    };
+    auto special=[&](size_t at) {
+        if(line[at]=='"'){++quotes;return quotes<=2;}
+        return field<N-1&&finish(at);
+    };
+    size_t at=0;
+    const auto comma=_mm_set1_epi8(','),quote=_mm_set1_epi8('"');
+    for(;at+16<=line.size();at+=16) {
+        auto bytes=_mm_loadu_si128(reinterpret_cast<const __m128i*>(line.data()+at));
+        unsigned mask=_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(bytes,comma),_mm_cmpeq_epi8(bytes,quote)));
+        while(mask){unsigned bit=std::countr_zero(mask);if(!special(at+bit))return false;mask&=mask-1;}
+    }
+    for(;at<line.size();++at)if(line[at]==','||line[at]=='"')if(!special(at))return false;
+    return field==N-1&&finish(line.size());
+#else
+    return csv_reference(line,fields);
+#endif
 }
 inline bool digits(SV s,uint64_t& n,uint64_t limit=INT64_MAX) {
     if(s.empty())return false;

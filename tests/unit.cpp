@@ -31,6 +31,14 @@ int main(){try{
     for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
     require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
     std::mt19937_64 rng(938151);
+    for(size_t round=0;round<200000;++round) {
+        const char alphabet[]="ab\"\",,, 0123\t\rXYZ";
+        std::string line;size_t length=rng()%150;
+        for(size_t i=0;i<length;++i)line+=alphabet[rng()%(sizeof(alphabet)-1)];
+        std::array<SV,7> scalar,simd;
+        bool a=csv_reference(line,scalar),b=csv(line,simd);
+        require(a==b&&(!a||scalar==simd),"SIMD CSV equals scalar parser");
+    }
     for(uint64_t width:{uint64_t(14*DAY),uint64_t(UINT32_MAX)+1,uint64_t(500*DAY)}) {
         std::vector<CompactEvent> rows;
         for(size_t i=0;i<100000;++i)rows.push_back({int64_t(1700000000000LL+rng()%width),0,0,uint32_t(rng()%8192)});

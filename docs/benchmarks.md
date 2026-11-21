@@ -31,6 +31,12 @@ Every timed output exactly matches the single-thread reference output.
 | DuckDB Ska Sort + compact IDs + hash dedup, 256 partitions | **12.462** |
 | Above + ported DuckDB HashBytes | **12.429** |
 | Corrected flat-table bucket hash + dense totals | **8.736** |
+| Above + SSE2 CSV special-character scanning | **8.534** |
+
+The SIMD candidate ran in 8.398, 8.534, and 8.630 seconds, all exact matches.
+It also passes 200K randomized scalar-versus-SIMD CSV comparisons and the full
+fixture suite. This is still far from the 0.3-second leaderboard target; the next
+experiment changes ID representation to remove pointer-heavy processing.
 
 The 8.736-second record uses flat deduplication, 256 partitions, compact IDs,
 ported DuckDB sorting/hashing, and dense campaign totals. Its three runs were
