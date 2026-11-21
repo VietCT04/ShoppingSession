@@ -388,3 +388,12 @@ position. A side array preserves full values when either field exceeds the
 compact range. Two five-pair runs measured **1.422 vs 1.478 seconds** and
 **1.078 vs 1.100 seconds**, with roughly 120 MiB lower peak RSS. Every 20M
 output matched the reference. Use `--wide-duplicate-locations` to compare.
+
+With 16-byte dedup records, the GCC profile-guided build reached a
+**0.979-second** median over five pinned 20M runs. The ordinary build took
+**1.064 seconds** in the same alternating batch. A second batch compared
+profile-guided builds under sustained host load and measured **1.297 seconds**
+with 16-byte records and **1.381 seconds** with the previous layout. Both
+tables matched the full reference in every run. The new profile-guided binary
+also passed all 36 fixtures, the official dev comparison, and a separate 20M
+run with default settings.
