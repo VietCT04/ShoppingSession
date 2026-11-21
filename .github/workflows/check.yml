@@ -17,6 +17,13 @@ jobs:
       - name: Build the submission image
         run: make docker
       - name: Run with scorer restrictions and compare exact outputs
+        env:
+          CPUS: "4"
+          MEM: 6g
+          NCPU: "8"
         run: |
+          FIXTURE_SINGLE=1 build/check fixtures scripts/docker_run.sh
           sh scripts/docker_run.sh data/dev out-container
           build/check compare out-container data/dev-answer
+          test "$(docker image inspect shopping-sessions:latest --format '{{.Architecture}}')" = amd64
+          test "$(docker image inspect shopping-sessions:latest --format '{{.Size}}')" -le 8589934592

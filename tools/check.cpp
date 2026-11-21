@@ -77,9 +77,11 @@ int main(int argc,char** argv) {
         else if(mode=="fixtures") {
             fs::create_directories("build/fixture-output");int cases=0;
             std::vector<fs::path> paths;for(auto& p:fs::directory_iterator("fixtures"))if(p.is_directory())paths.push_back(p.path());std::sort(paths.begin(),paths.end());
-            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense"}) {
+            std::vector<std::string> fixture_configs={"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense"};
+            if(std::getenv("FIXTURE_SINGLE"))fixture_configs={"production"};
+            for(const auto& p:paths)for(std::string config:fixture_configs) {
                 std::vector<std::string> args={argc>2?argv[2]:"build/shopping",(p/"input").string(),"build/fixture-output"};
-                if(config=="baseline")args.push_back("--baseline");else {
+                if(config=="baseline")args.push_back("--baseline");else if(config!="production") {
                     args.push_back("--no-compact");args.push_back("--no-group-person");args.push_back("--no-dense-totals");args.push_back("--sorter");args.push_back("std");
                     args.push_back("--dedup");args.push_back(config.substr(0,config.find('-')));
                     if(config.find("compact")!=std::string::npos)args.push_back("--compact");
