@@ -341,3 +341,8 @@ timestamps relative to the manifest window. On amd64, events now use 8 bytes
 and clicks use 16, down from 16 and 24. Across seven alternating pairs under
 sustained load, the median improved from **1.659 to 1.599 seconds**. The new
 layout was faster in all seven pairs, and every output matched the reference.
+
+The compact-range build set a new local 20M median of **1.204 seconds** with
+GCC profile-guided optimization. The ordinary build measured **1.276 seconds**
+in the same five-pair batch on eight pinned workers. Outputs matched exactly
+in all ten runs. Profile training used the separate official 1M dev input.
