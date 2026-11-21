@@ -217,7 +217,8 @@ struct Pipeline {
     Inputs in;
     PeopleType people;
     KeyFlatMap<uint32_t> person_lookup;
-    Dict<uint32_t> products,campaigns,category_index;
+    FlatMap<uint32_t> products,campaigns;
+    Dict<uint32_t> category_index;
     std::vector<SV> categories={"unknown"},campaign_names={"organic"},channels={"organic"};
     int64_t start,end;
     IngestOrder ingest_order;
@@ -255,13 +256,15 @@ struct Pipeline {
             std::array<SV,2> f;if(!csv(line,f))throw std::runtime_error("malformed products.csv");
             auto [it,added]=category_index.try_emplace(f[1],categories.size());
             if(added)categories.push_back(f[1]);
-            products.emplace(f[0],it->second);
+            products.try_emplace(f[0],it->second);
         });
         lookup.clear();in.add(o.data/"campaigns.csv",lookup);
         for(auto chunk:lookup)Inputs::lines(chunk,[&](SV line){
             std::array<SV,2> f;if(!csv(line,f))throw std::runtime_error("malformed campaigns.csv");
-            campaigns.emplace(f[0],campaign_names.size());campaign_names.push_back(f[0]);channels.push_back(f[1]);
+            campaigns.try_emplace(f[0],campaign_names.size());campaign_names.push_back(f[0]);channels.push_back(f[1]);
         });
+        products.freeze();
+        campaigns.freeze();
         if(o.packed_routing&&o.direct_encoding&&o.group_person) {
             if(uint64_t(end-start-1)<=UINT32_MAX&&categories.size()<=256)
                 routed_events.assign(o.threads,Buckets<RoutedEvent>(o.shards));

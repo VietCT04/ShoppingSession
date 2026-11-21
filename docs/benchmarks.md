@@ -318,3 +318,8 @@ The writer uses 32-bit Parquet count columns when the values fit, with a
 Across five alternating pairs the medians were **1.766 seconds** with narrower
 counts and **1.801 seconds** with 64-bit counts. All outputs matched the
 reference. Use `--wide-count-columns` for the 64-bit layout.
+
+The product and campaign dimensions use contiguous read-only hash tables with
+SIMD probe metadata and exact string comparisons. Two five-pair 20M runs
+measured medians of **1.739 vs 1.780 seconds** and **1.722 vs 1.772 seconds**
+against the node-based maps. Both tables matched the reference for every run.
