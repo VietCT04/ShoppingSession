@@ -5,6 +5,8 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -207,6 +209,30 @@ struct People {
 };
 struct Timer {
     std::chrono::steady_clock::time_point start=std::chrono::steady_clock::now(),last=start;
-    void mark(const char* label) {auto now=std::chrono::steady_clock::now();std::cerr<<label<<" "<<std::chrono::duration<double>(now-last).count()<<"s (total "<<std::chrono::duration<double>(now-start).count()<<"s)\n";last=now;}
+    int workers;
+    bool profile;
+    double last_cpu=0;
+    static double process_cpu() {
+        timespec value{};
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&value);
+        return double(value.tv_sec)+double(value.tv_nsec)*1e-9;
+    }
+    explicit Timer(int n=1):workers(n),profile(std::getenv("SHOP_PROFILE_CPU")!=nullptr) {
+        if(profile)last_cpu=process_cpu();
+    }
+    void mark(const char* label) {
+        auto now=std::chrono::steady_clock::now();
+        auto wall=std::chrono::duration<double>(now-last).count();
+        auto total=std::chrono::duration<double>(now-start).count();
+        std::cerr<<label<<" "<<wall<<"s (total "<<total<<"s)";
+        if(profile) {
+            auto cpu=process_cpu(), used=cpu-last_cpu;
+            std::cerr<<" cpu="<<used<<"s avg_workers="<<(wall>0?used/wall:0)
+                     <<" of "<<workers;
+            last_cpu=cpu;
+        }
+        std::cerr<<'\n';
+        last=now;
+    }
 };
 }

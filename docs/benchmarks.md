@@ -135,6 +135,12 @@ automatically when the window cannot fit in a 32-bit millisecond offset. Click
 timestamps remain absolute so clicks before the event window still qualify.
 Use `--wide-events` to force the 24-byte path.
 
+Encoding directly from per-worker buckets removes the gather copy before
+compaction. Across three alternating 20M runs, the median was **3.854 s** versus
+**3.906 s** for the gather path, and peak RSS fell by about 30 MiB. A separate
+experiment skipping the raw gather during deduplication took 3.933 s alone
+and 3.908 s with direct encoding, so that path remains opt-in.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

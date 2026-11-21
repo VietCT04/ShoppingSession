@@ -85,6 +85,7 @@ struct Options {
     bool array_active=true,array_categories=true;
     bool fast_time=true;
     bool narrow_events=true;
+    bool direct_dedup=false,direct_encoding=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -116,6 +117,9 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-fast-time")o.fast_time=false;
         else if(arg=="--narrow-events")o.narrow_events=true;
         else if(arg=="--wide-events")o.narrow_events=false;
+        else if(arg=="--direct-dedup")o.direct_dedup=true;
+        else if(arg=="--direct-encoding")o.direct_encoding=true;
+        else if(arg=="--no-direct-encoding")o.direct_encoding=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -259,9 +263,22 @@ struct Pipeline {
         parallel(o.dedup_shards,o.threads,[&](size_t s,int worker){
             size_t count=0;for(auto& w:raw)count+=w[s].size();
             if(!count)return;
+            auto emit=[&](const Raw& r){if(r.ts>=start)events[worker][shard(r.person)].push_back({r.person,r.ts,r.price,r.category});};
+            if(o.direct_dedup&&o.dedup=="flat") {
+                KeyFlatMap<const Raw*> winners;
+                winners.reserve(count);
+                for(const auto& buckets:raw) {
+                    for(const auto& event:buckets[s]) {
+                        auto [entry,inserted]=winners.try_emplace(event.id,&event);
+                        if(!inserted&&event.ingest<entry->second->ingest)entry->second=&event;
+                    }
+                }
+                winners.each([&](const Key&,const Raw* event){emit(*event);});
+                for(auto& buckets:raw)std::vector<Raw>().swap(buckets[s]);
+                return;
+            }
             std::vector<Raw> rows;rows.reserve(count);
             for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<Raw>().swap(w[s]);}
-            auto emit=[&](const Raw& r){if(r.ts>=start)events[worker][shard(r.person)].push_back({r.person,r.ts,r.price,r.category});};
             if(o.dedup=="dense") {
                 ankerl::unordered_dense::map<Key,size_t,DenseKeyHash> winners;winners.reserve(rows.size());
                 for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
@@ -296,44 +313,76 @@ struct Pipeline {
         size_t n=0;for(auto& w:workers)n+=w[s].size();std::vector<T> r;r.reserve(n);
         for(auto& w:workers){r.insert(r.end(),w[s].begin(),w[s].end());std::vector<T>().swap(w[s]);}return r;
     }
+    template<class T> static size_t bucket_size(const Workers<T>& workers,size_t shard) {
+        size_t count=0;
+        for(const auto& buckets:workers)count+=buckets[shard].size();
+        return count;
+    }
+    template<class T,class F> static void consume_bucket(Workers<T>& workers,size_t shard,F consume) {
+        for(auto& buckets:workers) {
+            auto& records=buckets[shard];
+            for(const auto& record:records)consume(record);
+            std::vector<T>().swap(records);
+        }
+    }
+    template<class E> void encode_shard(size_t shard,int worker,int64_t time_base) {
+        auto before=Clock::now();
+        if(o.direct_encoding) {
+            auto consume_events=[&](auto f){consume_bucket(events,shard,f);};
+            auto consume_clicks=[&](auto f){consume_bucket(clicks,shard,f);};
+            encode_partition<E>(shard,worker,bucket_size(events,shard),bucket_size(clicks,shard),
+                                consume_events,consume_clicks,time_base,before);
+        } else {
+            auto event_rows=gather(events,shard);
+            auto click_rows=gather(clicks,shard);
+            profiles[worker].gather+=elapsed(before);
+            auto consume_events=[&](auto f){for(const auto& event:event_rows)f(event);std::vector<Event>().swap(event_rows);};
+            auto consume_clicks=[&](auto f){for(const auto& click:click_rows)f(click);std::vector<Click>().swap(click_rows);};
+            encode_partition<E>(shard,worker,event_rows.size(),click_rows.size(),
+                                consume_events,consume_clicks,time_base,Clock::now());
+        }
+    }
     void sessionize() {
         parallel(o.shards,o.threads,[&](size_t s,int worker){
-            auto before=Clock::now();
-            auto ev=gather(events,s);auto cl=gather(clicks,s);
-            profiles[worker].gather+=elapsed(before);before=Clock::now();
             if(o.group_person&&o.narrow_events&&uint64_t(end-start-1)<=UINT32_MAX) {
-                encode_partition<RelativeEvent>(s,worker,std::move(ev),std::move(cl),start,before);
+                encode_shard<RelativeEvent>(s,worker,start);
             } else if(o.compact||o.group_person) {
-                encode_partition<CompactEvent>(s,worker,std::move(ev),std::move(cl),0,before);
-            } else process(s,worker,std::span(ev),std::span(cl),[](Key person){return person;});
+                encode_shard<CompactEvent>(s,worker,0);
+            } else {
+                auto before=Clock::now();
+                auto ev=gather(events,s);
+                auto cl=gather(clicks,s);
+                profiles[worker].gather+=elapsed(before);
+                process(s,worker,std::span(ev),std::span(cl),[](Key person){return person;});
+            }
         });
         WorkProfile sum;
         for(auto p:profiles){sum.gather+=p.gather;sum.intern+=p.intern;sum.sort+=p.sort;sum.aggregate+=p.aggregate;sum.parquet+=p.parquet;}
         std::cerr<<"session_work_seconds gather="<<sum.gather<<" intern="<<sum.intern<<" sort="<<sum.sort<<" aggregate="<<sum.aggregate<<" parquet="<<sum.parquet<<'\n';
     }
-    template<class E> void encode_partition(size_t s,int worker,std::vector<Event> ev,std::vector<Click> cl,
-                                            int64_t time_base,Clock::time_point before) {
+    template<class E,class ConsumeEvents,class ConsumeClicks>
+    void encode_partition(size_t s,int worker,size_t event_count,size_t click_count,
+                          ConsumeEvents consume_events,ConsumeClicks consume_clicks,
+                          int64_t time_base,Clock::time_point before) {
         KeyFlatMap<uint32_t> codes;
         std::vector<Key> names;
         std::vector<size_t> event_counts;
-        std::vector<E> compact_events;compact_events.reserve(ev.size());
-        for(auto& e:ev) {
+        std::vector<E> compact_events;compact_events.reserve(event_count);
+        consume_events([&](const Event& e) {
             auto [it,added]=codes.try_emplace(e.person,names.size());
             if(added){names.push_back(e.person);if(o.group_person)event_counts.push_back(0);}
             if(o.group_person)++event_counts[it->second];
             compact_events.push_back({static_cast<decltype(E::ts)>(e.ts-time_base),e.price,e.category,it->second});
-        }
-        std::vector<Event>().swap(ev);
-        std::vector<CompactClick> compact_clicks;compact_clicks.reserve(cl.size());
+        });
+        std::vector<CompactClick> compact_clicks;compact_clicks.reserve(click_count);
         std::vector<size_t> click_counts(o.group_person?names.size():0);
-        for(auto& c:cl) {
+        consume_clicks([&](const Click& c) {
             auto it=codes.find(c.person);
             if(it!=codes.end()){
                 compact_clicks.push_back({c.id,c.ts,c.campaign,it->second});
                 if(o.group_person)++click_counts[it->second];
             }
-        }
-        std::vector<Click>().swap(cl);
+        });
         profiles[worker].intern+=elapsed(before);
         if(o.group_person) {
             auto group_begin=Clock::now();
@@ -482,6 +531,14 @@ struct Pipeline {
         for(auto [key,t]:all){auto [day,cam]=key;cols[0].text(campaign_names[cam]);cols[1].text(channels[cam]);cols[2].number(day);cols[3].number(t.sessions);cols[4].number(t.purchasing);cols[5].number(t.revenue);cols[6].number(t.assisted);}
         parquet::write((o.out/"campaign_daily"/"part-0.parquet").string(),cols);
     }
-    void run(){Timer t;load();t.mark("load_links");parse_events();t.mark("parse_events");dedup();t.mark("dedup");parse_clicks();t.mark("parse_clicks");sessionize();t.mark("sessions_and_user_output");campaigns_output();t.mark("campaign_output");}
+    void run(){
+        Timer t(o.threads);
+        load();t.mark("load_links");
+        parse_events();t.mark("parse_events");
+        dedup();t.mark("dedup");
+        parse_clicks();t.mark("parse_clicks");
+        sessionize();t.mark("sessions_and_user_output");
+        campaigns_output();t.mark("campaign_output");
+    }
 };
 int main(int argc,char** argv){try{Pipeline(options(argc,argv)).run();return 0;}catch(const std::exception& e){std::cerr<<"shopping: "<<e.what()<<'\n';return 1;}}

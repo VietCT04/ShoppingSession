@@ -143,6 +143,13 @@ int main(int argc,char** argv) {
             configs.push_back({"array-both",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-active","--array-categories"}});
             configs.push_back({"strict-time",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-active","--array-categories","--fast-time"}});
             configs.push_back({"narrow-events",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-active","--array-categories","--fast-time","--narrow-events"}});
+            const auto narrow_control=configs.back().flags;
+            configs.push_back({"direct-encoding",narrow_control});
+            configs.back().flags.push_back("--direct-encoding");
+            configs.push_back({"direct-dedup",narrow_control});
+            configs.back().flags.push_back("--direct-dedup");
+            configs.push_back({"direct-both",configs.back().flags});
+            configs.back().flags.push_back("--direct-encoding");
             auto requested_binary=std::getenv("BINARY");
             if(!requested_binary||std::string(requested_binary).find("-ips")==std::string::npos)
                 configs.erase(std::remove_if(configs.begin(),configs.end(),[](const auto& c){return c.name.find("-ips")!=std::string::npos;}),configs.end());
@@ -162,7 +169,7 @@ int main(int argc,char** argv) {
                     std::vector<std::string> args={binary?binary:"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
                     // Matrix entries start from fixed defaults rather than the
                     // tuned production defaults. Explicit flags override these.
-                    args.insert(args.begin()+3,{"--wide-events","--no-fast-time","--no-compact","--no-array-active","--no-array-categories","--dedup-shards","0","--no-fused-csv","--no-group-person","--no-dense-totals","--sorter","std"});
+                    args.insert(args.begin()+3,{"--no-direct-encoding","--wide-events","--no-fast-time","--no-compact","--no-array-active","--no-array-categories","--dedup-shards","0","--no-fused-csv","--no-group-person","--no-dense-totals","--sorter","std"});
                     auto log=fs::path("benchmarks")/(config.name+"-"+std::to_string(i)+".log");
                     auto r=run(args,log);compare(db,out,argv[3]);times[index].push_back(r.seconds);
                     auto timestamp=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
