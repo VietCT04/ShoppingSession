@@ -376,3 +376,8 @@ Dedup marks losing payloads in place, including valid copies whose earliest
 copy was invalid. The five-pair median improved from **1.520 to 1.478 seconds**
 with about 180 MiB less peak RSS. Both tables matched the reference every run.
 Use `--copy-dedup-winners` to compare routing the surviving records afterward.
+
+With in-place marking, the ordinary and profile-guided builds reached exact
+five-run 20M medians of **1.109** and **1.106 seconds**, respectively. In a
+separate five-pair comparison of profile-guided builds, in-place marking
+improved the median from **1.395 to 1.344 seconds**. All outputs matched.
