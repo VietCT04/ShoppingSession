@@ -302,3 +302,13 @@ events, then resolves and routes those events. The 20M median fell from
 the reference. Use `--unbatched-link-probes` to reproduce the previous path.
 The batching experiment follows the general technique described in
 [Improving Hash Join Performance through Prefetching](https://pdl.cmu.edu/PDL-FTP/Database/icde04_abs.shtml).
+
+With the batched probes and profile-guided compilation, the five-run exact
+20M median was **1.342 seconds**, compared with **1.438 seconds** for the
+standard build in that batch. The profile-guided executable also passed all
+36 official fixtures, the official dev answers, and a separate 20M run with
+production defaults.
+
+A separate event-parser measurement took 0.153 seconds to extract fields,
+0.236 with timestamp parsing, 0.307 with ID encoding and hashing, and 0.470
+with partitioned record storage. These timings cover event ingest work only.
