@@ -120,6 +120,13 @@ int main(){try{
         Inputs::lines(chunk,[&](SV line){std::array<SV,7> f;if(csv_reference(line,f))expected.push_back(f);});
         scan_csv<7>(chunk,[&](const std::array<SV,7>& f){actual.push_back(f);});
         require(expected==actual,"fused CSV equals line/scalar parsing");
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        if(avx2_csv_available()) {
+            actual.clear();
+            scan_csv_avx2<7>(chunk,[&](const std::array<SV,7>& f){actual.push_back(f);});
+            require(expected==actual,"AVX2 CSV equals line/scalar parsing");
+        }
+#endif
     }
     for(size_t round=0;round<200000;++round) {
         std::string a,b;
