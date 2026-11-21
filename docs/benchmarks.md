@@ -323,3 +323,10 @@ The product and campaign dimensions use contiguous read-only hash tables with
 SIMD probe metadata and exact string comparisons. Two five-pair 20M runs
 measured medians of **1.739 vs 1.780 seconds** and **1.722 vs 1.772 seconds**
 against the node-based maps. Both tables matched the reference for every run.
+
+With linked users and compact routing, deduplication and click parsing now
+route by the original user ID. Grouping produces contiguous event and click
+ranges, resolves each alias once, and merges only the ranges that belong to
+the same canonical person. The five-pair median improved from **1.723 to
+1.638 seconds** on 20M, with exact matches in both tables for every run. Use
+`--no-redirect-linked-groups` to benchmark per-record alias resolution.
