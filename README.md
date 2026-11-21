@@ -116,6 +116,8 @@ map aggregation for comparison.
 `--no-fused-csv` restores separate newline/field scanning; the default scanner
 fuses both and immediately processes validated field views.
 `--dedup-shards N` tunes dedup cache locality independently of `--shards N`.
+Campaign-window membership and category revenue use arrays with sparse reset.
+`--no-array-active` and `--no-array-categories` restore the map implementations.
 
 ## Submission container
 

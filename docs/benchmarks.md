@@ -105,6 +105,21 @@ uses the person partition count for historical comparisons. All 540 fixture/
 configuration checks and official dev answers pass. This is independent work;
 no external competition implementation was incorporated.
 
+Array-backed campaign-window counters and category revenue were tested against
+the map-based state. The first mixed matrix was noisy; a focused five-repeat
+alternating comparison produced exact matches for every output:
+
+| State | Runs, seconds | Median |
+| --- | --- | ---: |
+| Map control | 3.808, 6.482, 6.334, 4.233, 4.387 | 4.387 |
+| Arrays with sparse membership/reset | 3.428, 3.378, 4.539, 4.167, 4.247 | **4.167** |
+
+Aggregation work fell from about 1.9–2.0 worker-seconds to 1.3–1.4. Both array
+states are selected; `--no-array-active` and `--no-array-categories` retain the
+original algorithms. All 648 fixture/configuration checks, official dev answers,
+and randomized multiplicity/reset/tie tests pass. Large host timing variation
+remains visible; these are local comparisons, not leaderboard scores.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

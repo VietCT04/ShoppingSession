@@ -82,12 +82,12 @@ int main(int argc,char** argv) {
             fs::path fixture_output=std::getenv("FIXTURE_SINGLE")?"build/production-fixture-output":"build/fixture-output";
             fs::create_directories(fixture_output);int cases=0;
             std::vector<fs::path> paths;for(auto& p:fs::directory_iterator("fixtures"))if(p.is_directory())paths.push_back(p.path());std::sort(paths.begin(),paths.end());
-            std::vector<std::string> fixture_configs={"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense","dense-person-dense","flat-person-dense-fused","flat-person-dense-ordered","flat-person-local"};
+            std::vector<std::string> fixture_configs={"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense","dense-person-dense","flat-person-dense-fused","flat-person-dense-ordered","flat-person-local","flat-person-local-active","flat-person-local-categories","flat-person-local-arrays"};
             if(std::getenv("FIXTURE_SINGLE"))fixture_configs={"production"};
             for(const auto& p:paths)for(std::string config:fixture_configs) {
                 std::vector<std::string> args={argc>2?argv[2]:"build/shopping",(p/"input").string(),fixture_output.string()};
                 if(config=="baseline")args.push_back("--baseline");else if(config!="production") {
-                    args.push_back("--no-compact");args.push_back("--dedup-shards");args.push_back("0");args.push_back("--no-fused-csv");args.push_back("--no-group-person");args.push_back("--no-dense-totals");args.push_back("--sorter");args.push_back("std");
+                    args.push_back("--no-compact");args.push_back("--no-array-active");args.push_back("--no-array-categories");args.push_back("--dedup-shards");args.push_back("0");args.push_back("--no-fused-csv");args.push_back("--no-group-person");args.push_back("--no-dense-totals");args.push_back("--sorter");args.push_back("std");
                     args.push_back("--dedup");args.push_back(config.substr(0,config.find('-')));
                     if(config.find("compact")!=std::string::npos)args.push_back("--compact");
                     if(config.find("duckdb")!=std::string::npos){args.push_back("--sorter");args.push_back("duckdb");}
@@ -96,7 +96,9 @@ int main(int argc,char** argv) {
                     if(config.find("person")!=std::string::npos)args.push_back("--group-person");
                     if(config.ends_with("-fused")){args.push_back("--fused-csv");args.push_back("--dense-totals");}
                     if(config.ends_with("-ordered")){args.push_back("--fused-csv");args.push_back("--ordered-ingest");args.push_back("--dense-totals");}
-                    if(config.ends_with("-local")){args.push_back("--fused-csv");args.push_back("--dense-totals");args.push_back("--dedup-shards");args.push_back("4096");}
+                    if(config.find("-local")!=std::string::npos){args.push_back("--fused-csv");args.push_back("--dense-totals");args.push_back("--dedup-shards");args.push_back("4096");}
+                    if(config.ends_with("-active")||config.ends_with("-arrays"))args.push_back("--array-active");
+                    if(config.ends_with("-categories")||config.ends_with("-arrays"))args.push_back("--array-categories");
                 }
                 run(args,"build/fixture.log");compare(db,fixture_output,p/"expected");
                 std::cout<<"PASS "<<p.filename().string()<<" "<<config<<'\n';++cases;
@@ -135,6 +137,9 @@ int main(int argc,char** argv) {
             configs.push_back({"dedup-local-1024",{"--threads","8","--shards","256","--dedup-shards","1024","--dedup","flat","--group-person","--dense-totals","--fused-csv"}});
             configs.push_back({"dedup-local-4096",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv"}});
             configs.push_back({"dedup-local-16384",{"--threads","8","--shards","256","--dedup-shards","16384","--dedup","flat","--group-person","--dense-totals","--fused-csv"}});
+            configs.push_back({"array-active",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-active"}});
+            configs.push_back({"array-categories",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-categories"}});
+            configs.push_back({"array-both",{"--threads","8","--shards","256","--dedup-shards","4096","--dedup","flat","--group-person","--dense-totals","--fused-csv","--array-active","--array-categories"}});
             auto requested_binary=std::getenv("BINARY");
             if(!requested_binary||std::string(requested_binary).find("-ips")==std::string::npos)
                 configs.erase(std::remove_if(configs.begin(),configs.end(),[](const auto& c){return c.name.find("-ips")!=std::string::npos;}),configs.end());
@@ -154,7 +159,7 @@ int main(int argc,char** argv) {
                     std::vector<std::string> args={binary?binary:"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
                     // Matrix entries start from fixed defaults rather than the
                     // tuned production defaults. Explicit flags override these.
-                    args.insert(args.begin()+3,{"--no-compact","--dedup-shards","0","--no-fused-csv","--no-group-person","--no-dense-totals","--sorter","std"});
+                    args.insert(args.begin()+3,{"--no-compact","--no-array-active","--no-array-categories","--dedup-shards","0","--no-fused-csv","--no-group-person","--no-dense-totals","--sorter","std"});
                     auto log=fs::path("benchmarks")/(config.name+"-"+std::to_string(i)+".log");
                     auto r=run(args,log);compare(db,out,argv[3]);times[index].push_back(r.seconds);
                     auto timestamp=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();

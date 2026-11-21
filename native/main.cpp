@@ -5,6 +5,7 @@
 #include "id.hpp"
 #include "csv_scan.hpp"
 #include "ingest_order.hpp"
+#include "sparse_state.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
 #ifdef SHOP_IPS_SORTS
 #include "ips4o.hpp"
@@ -75,6 +76,7 @@ struct Options {
     bool group_person=true;
     bool fused_csv=true;
     bool ordered_ingest=false;
+    bool array_active=true,array_categories=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -98,6 +100,10 @@ Options options(int argc,char** argv) {
         else if(arg=="--fused-csv")o.fused_csv=true;
         else if(arg=="--no-fused-csv")o.fused_csv=false;
         else if(arg=="--ordered-ingest")o.ordered_ingest=true;
+        else if(arg=="--array-active")o.array_active=true;
+        else if(arg=="--array-categories")o.array_categories=true;
+        else if(arg=="--no-array-active")o.array_active=false;
+        else if(arg=="--no-array-categories")o.array_categories=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -110,7 +116,7 @@ Options options(int argc,char** argv) {
         else if(positional==2)o.out=arg;
         else throw std::runtime_error("too many paths");
     }
-    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.fused_csv=false;o.ordered_ingest=false;o.sorter="std";}
+    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.fused_csv=false;o.ordered_ingest=false;o.array_active=false;o.array_categories=false;o.sorter="std";}
     if(!o.dedup_shards||o.baseline)o.dedup_shards=o.shards;
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup_shards<1||o.dedup_shards>16384||(o.dedup_shards&(o.dedup_shards-1)))throw std::runtime_error("dedup-shards must be a power of two in 1..16384");
@@ -376,6 +382,8 @@ struct Pipeline {
             using parquet::Column;
             std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",2},{"events",2},{"revenue_cents",2},{"top_category",6,true}};
             size_t cb=0;
+            CampaignWindow campaign_window(o.array_active?campaign_names.size():0);
+            CategoryRevenue category_revenue(o.array_categories?categories.size():0);
             for(size_t begin=0;begin<ev.size();) {
                 size_t finish=begin+1;auto person_key=ev[begin].person;auto person_name=name(person_key);SV person=text(person_name);
                 while(finish<ev.size()&&ev[finish].person==person_key)++finish;
@@ -383,21 +391,29 @@ struct Pipeline {
                 size_t ce=cb;while(ce<cl.size()&&cl[ce].person==person_key)++ce;
                 size_t hi=cb,lo=cb;
                 std::unordered_map<uint32_t,size_t> active;
+                campaign_window.clear();
                 int64_t day=-1,ns=0,ne=0,nr=0;
                 std::unordered_map<uint32_t,int64_t> cat_revenue;
                 auto flush=[&]{
                     if(!ns)return;
                     cols[0].text(person);cols[1].number(day);cols[2].number(ns);cols[3].number(ne);cols[4].number(nr);
-                    if(cat_revenue.empty())cols[5].null();
+                    if(o.array_categories) {
+                        if(category_revenue.present.empty())cols[5].null();
+                        else cols[5].text(categories[category_revenue.top(categories)]);
+                    } else if(cat_revenue.empty())cols[5].null();
                     else {uint32_t top=0;int64_t amount=-1;for(auto [c,r]:cat_revenue)if(r>amount||(r==amount&&categories[c]<categories[top])){top=c;amount=r;}cols[5].text(categories[top]);}
-                    ns=ne=nr=0;cat_revenue.clear();
+                    ns=ne=nr=0;cat_revenue.clear();category_revenue.clear();
                 };
                 for(size_t i=begin;i<finish;) {
                     const int64_t st=ev[i].ts,sd=dayof(st);
                     if(sd!=day){flush();day=sd;}
                     size_t j=i+1;while(j<finish&&ev[j].ts-ev[j-1].ts<=GAP)++j;
                     int64_t revenue=0;
-                    for(size_t k=i;k<j;++k)if(ev[k].price){revenue+=ev[k].price;cat_revenue[ev[k].category]+=ev[k].price;}
+                    for(size_t k=i;k<j;++k)if(ev[k].price){
+                        revenue+=ev[k].price;
+                        if(o.array_categories)category_revenue.add(ev[k].category,ev[k].price);
+                        else cat_revenue[ev[k].category]+=ev[k].price;
+                    }
                     ++ns;ne+=j-i;nr+=revenue;
                     uint32_t credited=0;
                     if(o.baseline) {
@@ -405,6 +421,11 @@ struct Pipeline {
                         std::unordered_map<uint32_t,bool> assisted;
                         for(size_t k=cb;k<ce;++k)if(cl[k].ts<=st&&cl[k].ts>=st-WEEK){credited=cl[k].campaign;assisted[credited]=true;}
                         for(auto [cam,unused]:assisted)++total(worker,sd,cam).assisted;
+                    } else if(o.array_active) {
+                        while(hi<ce&&cl[hi].ts<=st){campaign_window.add(cl[hi].campaign);++hi;}
+                        while(lo<hi&&cl[lo].ts<st-WEEK){campaign_window.remove(cl[lo].campaign);++lo;}
+                        if(hi>lo)credited=cl[hi-1].campaign;
+                        for(auto cam:campaign_window.present)++total(worker,sd,cam).assisted;
                     } else {
                         while(hi<ce&&cl[hi].ts<=st){++active[cl[hi].campaign];++hi;}
                         while(lo<hi&&cl[lo].ts<st-WEEK){auto it=active.find(cl[lo].campaign);if(!--it->second)active.erase(it);++lo;}

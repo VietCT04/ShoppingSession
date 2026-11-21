@@ -4,6 +4,7 @@
 #include "../native/id.hpp"
 #include "../native/csv_scan.hpp"
 #include "../native/ingest_order.hpp"
+#include "../native/sparse_state.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <random>
@@ -35,6 +36,23 @@ int main(){try{
     for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
     require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
     std::mt19937_64 rng(938151);
+    {
+        CampaignWindow window(257);std::vector<size_t> counts(257);
+        for(size_t i=0;i<100000;++i) {
+            uint32_t c=rng()%257;
+            if(counts[c]&&rng()%2){window.remove(c);--counts[c];}else{window.add(c);++counts[c];}
+            require(window.count==counts,"campaign window exact multiplicity");
+            auto active=window.present;std::sort(active.begin(),active.end());
+            std::vector<uint32_t> expected;for(uint32_t j=0;j<counts.size();++j)if(counts[j])expected.push_back(j);
+            require(active==expected,"campaign window unique active membership");
+            if(i%1000==999){window.clear();std::fill(counts.begin(),counts.end(),0);}
+        }
+        CategoryRevenue revenue(3);std::vector<SV> names={"unknown","z","a"};
+        revenue.add(0,5);revenue.add(1,10);revenue.add(2,10);
+        require(revenue.top(names)==2,"array category revenue byte tie");
+        revenue.add(0,100);require(revenue.top(names)==0,"array unknown category can win");
+        revenue.clear();require(revenue.present.empty()&&revenue.sum==std::vector<int64_t>(3),"category reset");
+    }
     {
         auto format=[](int64_t epoch) {
             int64_t day=dayof(epoch),second=(epoch-day*DAY)/1000;
