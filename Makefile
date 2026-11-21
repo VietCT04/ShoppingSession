@@ -12,6 +12,8 @@ NATIVE_HEADERS := $(wildcard native/*.hpp)
 
 .PHONY: all baseline run fixtures check-dev dev benchmark clean docker test
 all: $(BUILD)/shopping
+$(BUILD)/shopping-early: native/main.cpp $(NATIVE_HEADERS) $(wildcard third_party/duckdb_sort/*.h*) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DSHOP_EARLY_IDS native/main.cpp -o $@
 $(BUILD)/shopping-ips: native/main.cpp $(NATIVE_HEADERS) $(wildcard third_party/duckdb_sort/*.h*) | $(BUILD)
 	sh scripts/bootstrap-ips.sh
 	$(CXX) $(CXXFLAGS) -DSHOP_IPS_SORTS -isystem third_party/ips4o/include -isystem third_party/ips2ra/include -isystem build/vendor/ips/root/usr/include native/main.cpp -Lbuild/vendor/ips/root/usr/lib/x86_64-linux-gnu -Wl,-rpath,'$$ORIGIN/vendor/ips/root/usr/lib/x86_64-linux-gnu' -ltbb -latomic -o $@

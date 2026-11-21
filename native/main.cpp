@@ -27,22 +27,39 @@ SV text(SV s){return s;}
 #endif
 template<class V>using KeyDict=std::unordered_map<Key,V,KeyHash>;
 template<class V>using KeyFlatMap=FlatMap<V,Key,KeyHash>;
+#ifdef SHOP_EARLY_IDS
+struct PersonKey {
+    uint32_t code=UINT32_MAX, partition=0;
+    auto operator<=>(const PersonKey&)const=default;
+};
+struct PersonDictionary {
+    KeyFlatMap<uint32_t> codes;
+    std::vector<Key> names;
+    std::mutex mutex;
+};
+struct PersonCacheEntry {
+    Key input{};
+    PersonKey person;
+};
+#else
+using PersonKey=Key;
+#endif
 struct DenseKeyHash {
     using is_avalanching=void;
     size_t operator()(const Key& key)const noexcept {auto h=KeyHash{}(key);return h^(h>>32);}
 };
-struct Raw {Key id,person;int64_t ts,ingest;uint32_t price,category;};
+struct Raw {Key id;PersonKey person;int64_t ts,ingest;uint32_t price,category;};
 struct Event {
-    Key person;int64_t ts;uint32_t price,category;
+    PersonKey person;int64_t ts;uint32_t price,category;
     bool operator<(const Event& b)const{return person!=b.person?person<b.person:ts<b.ts;}
 };
-struct Click {Key person,id;int64_t ts;uint32_t campaign;};
+struct Click {PersonKey person;Key id;int64_t ts;uint32_t campaign;};
 struct RelativeEvent {
     uint32_t ts,price,category,person;
     bool operator<(const RelativeEvent& other)const{return ts<other.ts;}
 };
 static_assert(sizeof(RelativeEvent)==16);
-#ifdef SHOP_PACKED_IDS
+#if defined(SHOP_PACKED_IDS) && !defined(SHOP_EARLY_IDS)
 struct PackedEventSortKey {
     bool requires_next_sort=true;
     static constexpr size_t ska_sort_width=8;
@@ -157,11 +174,25 @@ struct Pipeline {
     std::vector<CampaignTotals> totals;
     std::vector<std::vector<Aggregate>> dense_totals;
     std::vector<WorkProfile> profiles;
+#ifdef SHOP_EARLY_IDS
+    std::unique_ptr<PersonDictionary[]> dictionaries;
+    std::vector<std::vector<PersonCacheEntry>> person_caches;
+#endif
     explicit Pipeline(Options options):o(std::move(options)),raw(o.threads,Buckets<Raw>(o.dedup_shards)),
-        events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
+        events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads)
+#ifdef SHOP_EARLY_IDS
+        ,dictionaries(new PersonDictionary[o.shards]),person_caches(o.threads,std::vector<PersonCacheEntry>(4096))
+#endif
+        {}
     using Clock=std::chrono::steady_clock;
     static double elapsed(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
-    size_t shard(Key s)const{return KeyHash{}(s)&(o.shards-1);}
+    size_t shard(PersonKey person)const{
+#ifdef SHOP_EARLY_IDS
+        return person.partition;
+#else
+        return KeyHash{}(person)&(o.shards-1);
+#endif
+    }
     size_t event_shard(Key s)const{return KeyHash{}(s)&(o.dedup_shards-1);}
     void load() {
         std::ifstream mf(o.data/"manifest.json");
@@ -225,6 +256,44 @@ struct Pipeline {
         auto it=person_lookup.find(s);return it==person_lookup.end()?s:people.names[it->second];
 #endif
     }
+    PersonKey event_person(Key input,int worker) {
+#ifdef SHOP_EARLY_IDS
+        auto& cache=person_caches[worker];
+        auto& entry=cache[KeyHash{}(input)&(cache.size()-1)];
+        if(entry.person.code!=UINT32_MAX&&entry.input==input)return entry.person;
+        auto name=canonical(input);
+        const uint32_t partition=KeyHash{}(name)&(o.shards-1);
+        auto& dictionary=dictionaries[partition];
+        std::lock_guard<std::mutex> guard(dictionary.mutex);
+        if(dictionary.names.size()>=UINT32_MAX)throw std::runtime_error("too many distinct people in a partition");
+        auto [slot,inserted]=dictionary.codes.try_emplace(name,dictionary.names.size());
+        if(inserted)dictionary.names.push_back(name);
+        entry={input,{slot->second,partition}};
+        return entry.person;
+#else
+        (void)worker;
+        return canonical(input);
+#endif
+    }
+    bool click_person(Key input,PersonKey& person)const {
+        auto name=canonical(input);
+#ifdef SHOP_EARLY_IDS
+        const uint32_t partition=KeyHash{}(name)&(o.shards-1);
+        auto slot=dictionaries[partition].codes.find(name);
+        if(!slot)return false;
+        person={slot->second,partition};
+#else
+        person=name;
+#endif
+        return true;
+    }
+    Key name_of(PersonKey person)const {
+#ifdef SHOP_EARLY_IDS
+        return dictionaries[person.partition].names[person.code];
+#else
+        return person;
+#endif
+    }
     Aggregate& total(int worker,int64_t day,uint32_t campaign) {
         if(o.dense_totals)return dense_totals[worker][size_t(day-dayof(start))*campaign_names.size()+campaign];
         return totals[worker][{day,campaign}];
@@ -251,7 +320,8 @@ struct Pipeline {
                 }
                 if(!valid)ts=-1;
                 Key event_id(f[0]);
-                raw[worker][event_shard(event_id)].push_back({event_id,canonical(Key(f[1])),ts,ingest,uint32_t(price),category});
+                auto person=valid?event_person(Key(f[1]),worker):PersonKey{};
+                raw[worker][event_shard(event_id)].push_back({event_id,person,ts,ingest,uint32_t(price),category});
             });
         });
     }
@@ -286,7 +356,8 @@ struct Pipeline {
                 if(f[0].empty()||f[1].empty())return;
                 auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
                 auto ts=parse_time(f[3]);if(ts<start-WEEK||ts>=end)return;
-                auto p=canonical(Key(f[1]));clicks[worker][shard(p)].push_back({p,Key(f[0]),ts,it->second});
+                PersonKey person;
+                if(click_person(Key(f[1]),person))clicks[worker][shard(person)].push_back({person,Key(f[0]),ts,it->second});
             });
         });
         // Identical duplicate clicks need no materialized dedup: they cannot
@@ -305,7 +376,7 @@ struct Pipeline {
                 encode_partition<RelativeEvent>(s,worker,std::move(ev),std::move(cl),start,before);
             } else if(o.compact||o.group_person) {
                 encode_partition<CompactEvent>(s,worker,std::move(ev),std::move(cl),0,before);
-            } else process(s,worker,std::span(ev),std::span(cl),[](Key person){return person;});
+            } else process(s,worker,std::span(ev),std::span(cl),[&](PersonKey person){return name_of(person);});
         });
         WorkProfile sum;
         for(auto p:profiles){sum.gather+=p.gather;sum.intern+=p.intern;sum.sort+=p.sort;sum.aggregate+=p.aggregate;sum.parquet+=p.parquet;}
@@ -316,22 +387,36 @@ struct Pipeline {
         KeyFlatMap<uint32_t> codes;
         std::vector<Key> names;
         std::vector<size_t> event_counts;
+#ifdef SHOP_EARLY_IDS
+        names=std::move(dictionaries[s].names);
+        if(o.group_person)event_counts.resize(names.size());
+#endif
         std::vector<E> compact_events;compact_events.reserve(ev.size());
         for(auto& e:ev) {
+#ifdef SHOP_EARLY_IDS
+            const auto code=e.person.code;
+#else
             auto [it,added]=codes.try_emplace(e.person,names.size());
             if(added){names.push_back(e.person);if(o.group_person)event_counts.push_back(0);}
-            if(o.group_person)++event_counts[it->second];
-            compact_events.push_back({static_cast<decltype(E::ts)>(e.ts-time_base),e.price,e.category,it->second});
+            const auto code=it->second;
+#endif
+            if(o.group_person)++event_counts[code];
+            compact_events.push_back({static_cast<decltype(E::ts)>(e.ts-time_base),e.price,e.category,code});
         }
         std::vector<Event>().swap(ev);
         std::vector<CompactClick> compact_clicks;compact_clicks.reserve(cl.size());
         std::vector<size_t> click_counts(o.group_person?names.size():0);
         for(auto& c:cl) {
+#ifdef SHOP_EARLY_IDS
+            const auto code=c.person.code;
+            if(o.group_person&&!event_counts[code])continue;
+#else
             auto it=codes.find(c.person);
-            if(it!=codes.end()){
-                compact_clicks.push_back({c.id,c.ts,c.campaign,it->second});
-                if(o.group_person)++click_counts[it->second];
-            }
+            if(it==codes.end())continue;
+            const auto code=it->second;
+#endif
+            compact_clicks.push_back({c.id,c.ts,c.campaign,code});
+            if(o.group_person)++click_counts[code];
         }
         std::vector<Click>().swap(cl);
         profiles[worker].intern+=elapsed(before);
@@ -392,7 +477,7 @@ struct Pipeline {
                 if constexpr(std::is_same_v<E,CompactEvent>) {
                     duckdb_sort_events(ev,start,end);
                 } else {
-#ifdef SHOP_PACKED_IDS
+#if defined(SHOP_PACKED_IDS) && !defined(SHOP_EARLY_IDS)
                     if(ev.size()>1)duckdb_ska_sort::ska_sort(ev.begin(),ev.end(),PackedEventSortKey{});
 #else
                     duckdb_pdqsort::pdqsort(ev.begin(),ev.end(),event_less);
