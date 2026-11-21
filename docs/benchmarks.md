@@ -403,3 +403,9 @@ combines the independent validity and lateness checks. The five-pair repeat
 on the 16-byte dedup layout measured **1.067 vs 1.073 seconds**. The new path
 was faster in four pairs and all ten full 20M outputs matched the reference.
 Use `--conditional-event-validation` to compare the former validation path.
+
+Worker-local event and click vectors reserve space using the actual byte
+count of each input. The vectors still grow for skewed partitions. Two
+five-pair runs measured **1.387 vs 1.428 seconds** and **1.022 vs 1.042
+seconds**, with approximately 170 MiB higher peak RSS. All 20M outputs
+matched the reference. Use `--grow-routes` to compare growth on demand.

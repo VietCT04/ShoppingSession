@@ -142,6 +142,7 @@ struct Options {
     bool mark_duplicate_events=true;
     bool narrow_duplicate_locations=true;
     bool branchless_event_validation=true;
+    bool reserve_routes=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -212,6 +213,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--wide-duplicate-locations")o.narrow_duplicate_locations=false;
         else if(arg=="--branchless-event-validation")o.branchless_event_validation=true;
         else if(arg=="--conditional-event-validation")o.branchless_event_validation=false;
+        else if(arg=="--reserve-routes")o.reserve_routes=true;
+        else if(arg=="--grow-routes")o.reserve_routes=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -272,6 +275,19 @@ struct Pipeline {
     static double elapsed(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
     size_t shard(Key s)const{return KeyHash{}(s)&(o.shards-1);}
     size_t event_shard(Key s)const{return KeyHash{}(s)&(o.dedup_shards-1);}
+    template<class T>
+    void reserve_routes(Workers<T>& routes,const std::vector<Chunk>& chunks,size_t bytes_per_row) {
+        if(routes.empty())return;
+        size_t bytes=0;
+        for(auto chunk:chunks)bytes+=chunk.end-chunk.begin;
+        size_t expected=bytes/(bytes_per_row*o.threads*o.shards);
+        if(expected<32)return;
+        try {
+            for(auto& worker:routes)for(auto& shard:worker)shard.reserve(expected);
+        } catch(const std::bad_alloc&) {
+            // Partial reservations are valid and vectors can still grow on demand.
+        }
+    }
     void load() {
         std::ifstream mf(o.data/"manifest.json");
         if(!mf)throw std::runtime_error("cannot open manifest.json");
@@ -318,6 +334,10 @@ struct Pipeline {
         if(!o.overlap_links)build_links();
         for(auto p:files(o.data/"events"))in.add(p,in.events);
         for(auto p:files(o.data/"clicks"))in.add(p,in.clicks);
+        if(o.reserve_routes) {
+            reserve_routes(routed_events,in.events,64);
+            reserve_routes(routed_clicks,in.clicks,40);
+        }
         fs::create_directories(o.out/"user_daily");fs::create_directories(o.out/"campaign_daily");
         // Replace only our table outputs, so rerunning never leaves extra rows.
         for(auto table:{"user_daily","campaign_daily"})for(auto p:files_parquet(o.out/table))fs::remove(p);
