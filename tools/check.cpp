@@ -77,16 +77,17 @@ int main(int argc,char** argv) {
         else if(mode=="fixtures") {
             fs::create_directories("build/fixture-output");int cases=0;
             std::vector<fs::path> paths;for(auto& p:fs::directory_iterator("fixtures"))if(p.is_directory())paths.push_back(p.path());std::sort(paths.begin(),paths.end());
-            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense","dense-person-dense"}) {
+            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense","dense-person-dense","flat-person-dense-fused"}) {
                 std::vector<std::string> args={argc>2?argv[2]:"build/shopping",(p/"input").string(),"build/fixture-output"};
                 if(config=="baseline")args.push_back("--baseline");else {
-                    args.push_back("--no-compact");args.push_back("--no-group-person");args.push_back("--no-dense-totals");args.push_back("--sorter");args.push_back("std");
+                    args.push_back("--no-compact");args.push_back("--no-fused-csv");args.push_back("--no-group-person");args.push_back("--no-dense-totals");args.push_back("--sorter");args.push_back("std");
                     args.push_back("--dedup");args.push_back(config.substr(0,config.find('-')));
                     if(config.find("compact")!=std::string::npos)args.push_back("--compact");
                     if(config.find("duckdb")!=std::string::npos){args.push_back("--sorter");args.push_back("duckdb");}
                     if(config.ends_with("-frozen"))args.push_back("--flat-links");
                     if(config.ends_with("-dense"))args.push_back("--dense-totals");
                     if(config.find("person")!=std::string::npos)args.push_back("--group-person");
+                    if(config.ends_with("-fused")){args.push_back("--fused-csv");args.push_back("--dense-totals");}
                 }
                 run(args,"build/fixture.log");compare(db,"build/fixture-output",p/"expected");
                 std::cout<<"PASS "<<p.filename().string()<<" "<<config<<'\n';++cases;
@@ -120,6 +121,10 @@ int main(int argc,char** argv) {
             configs.push_back({"person-dense-8-256",{"--threads","8","--shards","256","--dedup","dense","--sorter","duckdb","--group-person","--dense-totals"}});
             configs.push_back({"person-ips4o-8-256",{"--threads","8","--shards","256","--dedup","flat","--group-person","--dense-totals","--group-sort","ips4o"}});
             configs.push_back({"person-ips2ra-8-256",{"--threads","8","--shards","256","--dedup","flat","--group-person","--dense-totals","--group-sort","ips2ra"}});
+            configs.push_back({"person-fused-8-256",{"--threads","8","--shards","256","--dedup","flat","--group-person","--dense-totals","--fused-csv"}});
+            auto requested_binary=std::getenv("BINARY");
+            if(!requested_binary||std::string(requested_binary).find("-ips")==std::string::npos)
+                configs.erase(std::remove_if(configs.begin(),configs.end(),[](const auto& c){return c.name.find("-ips")!=std::string::npos;}),configs.end());
             // SKIP_BASELINE is useful when timing large datasets against a
             // previously computed oracle. Correctness remains mandatory.
             if(std::getenv("SKIP_BASELINE"))configs.erase(configs.begin());
@@ -136,7 +141,7 @@ int main(int argc,char** argv) {
                     std::vector<std::string> args={binary?binary:"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
                     // Matrix entries start from fixed defaults rather than the
                     // tuned production defaults. Explicit flags override these.
-                    args.insert(args.begin()+3,{"--no-compact","--no-group-person","--no-dense-totals","--sorter","std"});
+                    args.insert(args.begin()+3,{"--no-compact","--no-fused-csv","--no-group-person","--no-dense-totals","--sorter","std"});
                     auto log=fs::path("benchmarks")/(config.name+"-"+std::to_string(i)+".log");
                     auto r=run(args,log);compare(db,out,argv[3]);times[index].push_back(r.seconds);
                     auto timestamp=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();

@@ -65,6 +65,22 @@ observed local median for the same algorithm; it does not establish an algorithm
 gain over the earlier 4.992-second run. The verified `submit-v1` tag stays frozen
 on main while experiments continue in a separate worktree.
 
+Fused line/field CSV scanning was compared in alternating order against the
+same build's original scanner. All six outputs match:
+
+| CSV scanner | Runs, seconds | Median |
+| --- | --- | ---: |
+| Separate line/field scanning | 5.389, 4.730, 4.877 | 4.877 |
+| Fused scanning | 5.092, 4.707, 4.769 | **4.769** |
+
+Event parsing's median fell from 2.103 to 1.969 seconds. The callback processes
+mapped fields immediately, without a preceding newline scan. The total gain is
+small (about 2.2%) and host-dependent. All 468 fixture/configuration checks,
+official dev answers, and randomized fused-versus-scalar CSV tests pass. Fused
+scanning is now the default; `--no-fused-csv` retains the old path. This is
+original C++ code inspired by the fused model in the csveee paper, not a claim
+to reproduce its server benchmark throughput.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

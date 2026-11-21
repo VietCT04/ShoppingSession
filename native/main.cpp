@@ -3,6 +3,7 @@
 #include "flat_map.hpp"
 #include "sort.hpp"
 #include "id.hpp"
+#include "csv_scan.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
 #ifdef SHOP_IPS_SORTS
 #include "ips4o.hpp"
@@ -71,6 +72,7 @@ struct Options {
     bool flat_links=false;
     bool dense_totals=true;
     bool group_person=true;
+    bool fused_csv=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -91,6 +93,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-dense-totals")o.dense_totals=false;
         else if(arg=="--group-person")o.group_person=true;
         else if(arg=="--no-group-person")o.group_person=false;
+        else if(arg=="--fused-csv")o.fused_csv=true;
+        else if(arg=="--no-fused-csv")o.fused_csv=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup"&&i+1<argc)o.dedup=argv[++i];
@@ -102,7 +106,7 @@ Options options(int argc,char** argv) {
         else if(positional==2)o.out=arg;
         else throw std::runtime_error("too many paths");
     }
-    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.sorter="std";}
+    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.group_person=false;o.fused_csv=false;o.sorter="std";}
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat"&&o.dedup!="dense")throw std::runtime_error("dedup must be sort, hash, flat, or dense");
     if(o.sorter!="std"&&o.sorter!="duckdb")throw std::runtime_error("sorter must be std or duckdb");
@@ -195,10 +199,14 @@ struct Pipeline {
         if(o.dense_totals)return dense_totals[worker][size_t(day-dayof(start))*campaign_names.size()+campaign];
         return totals[worker][{day,campaign}];
     }
+    template<size_t N,class F>void records(Chunk chunk,F consume)const {
+        if(o.fused_csv)scan_csv<N>(chunk,consume);
+        else Inputs::lines(chunk,[&](SV line){std::array<SV,N> fields;if(csv(line,fields))consume(fields);});
+    }
     void parse_events() {
         parallel(in.events.size(),o.threads,[&](size_t i,int worker){
-            Inputs::lines(in.events[i],[&](SV line){
-                std::array<SV,7> f;if(!csv(line,f)||f[0].empty())return;
+            records<7>(in.events[i],[&](const std::array<SV,7>& f){
+                if(f[0].empty())return;
                 // Invalid winners remain in the dedup input. A later valid copy
                 // must never rescue an invalid earliest copy.
                 int64_t ts=timestamp(f[2]),ingest=timestamp(f[3]);
@@ -242,8 +250,8 @@ struct Pipeline {
     }
     void parse_clicks() {
         parallel(in.clicks.size(),o.threads,[&](size_t i,int worker){
-            Inputs::lines(in.clicks[i],[&](SV line){
-                std::array<SV,4> f;if(!csv(line,f)||f[0].empty()||f[1].empty())return;
+            records<4>(in.clicks[i],[&](const std::array<SV,4>& f){
+                if(f[0].empty()||f[1].empty())return;
                 auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
                 auto ts=timestamp(f[3]);if(ts<start-WEEK||ts>=end)return;
                 auto p=canonical(Key(f[1]));clicks[worker][shard(p)].push_back({p,Key(f[0]),ts,it->second});

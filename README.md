@@ -112,6 +112,8 @@ bytes use an exact general path. `--compact` enables intermediate integer IDs
 for comparison. `--no-dense-totals` restores
 map aggregation for comparison.
 `--no-group-person` restores sorting by person/time within each hash partition.
+`--no-fused-csv` restores separate newline/field scanning; the default scanner
+fuses both and immediately processes validated field views.
 
 ## Submission container
 

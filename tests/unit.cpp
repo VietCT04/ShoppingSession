@@ -2,6 +2,7 @@
 #include "../native/sort.hpp"
 #include "../native/flat_map.hpp"
 #include "../native/id.hpp"
+#include "../native/csv_scan.hpp"
 #include <cstdlib>
 #include <random>
 using namespace shop;
@@ -32,6 +33,27 @@ int main(){try{
     for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
     require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
     std::mt19937_64 rng(938151);
+    for(size_t round=0;round<3000;++round) {
+        std::string buffer;
+        for(size_t row=0;row<20;++row) {
+            std::string record;
+            for(size_t field=0;field<7;++field) {
+                if(field)record+=',';
+                bool quoted=rng()%2;
+                if(quoted)record+='"';
+                for(size_t j=0,n=rng()%30;j<n;++j)record+="abXYZ012 \t\r"[rng()%11];
+                if(quoted)record+='"';
+            }
+            if(rng()%4==0)record.insert(rng()%(record.size()+1),1,',');
+            if(rng()%4==0)record.insert(rng()%(record.size()+1),1,'"');
+            buffer+=record;if(row!=19||rng()%2)buffer+='\n';
+        }
+        std::vector<std::array<SV,7>> expected,actual;
+        Chunk chunk{buffer.data(),buffer.data()+buffer.size()};
+        Inputs::lines(chunk,[&](SV line){std::array<SV,7> f;if(csv_reference(line,f))expected.push_back(f);});
+        scan_csv<7>(chunk,[&](const std::array<SV,7>& f){actual.push_back(f);});
+        require(expected==actual,"fused CSV equals line/scalar parsing");
+    }
     for(size_t round=0;round<200000;++round) {
         std::string a,b;
         for(size_t i=0,n=rng()%40;i<n;++i)a+=char(rng()%256);
