@@ -89,7 +89,7 @@ struct Options {
     bool overlap_links=true;
     bool avx2_csv=true;
     bool tag_links=true,heavy_shards_first=false;
-    bool sparse_duplicates=false;
+    bool sparse_duplicates=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -132,6 +132,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-tag-links")o.tag_links=false;
         else if(arg=="--heavy-shards-first")o.heavy_shards_first=true;
         else if(arg=="--sparse-duplicates")o.sparse_duplicates=true;
+        else if(arg=="--no-sparse-duplicates")o.sparse_duplicates=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);

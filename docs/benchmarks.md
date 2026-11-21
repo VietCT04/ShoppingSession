@@ -169,6 +169,14 @@ with a median of **0.865 s** versus **0.942 s**. The complete benchmark
 medians were **2.868 s** and **2.889 s** respectively, with all outputs equal.
 Use `--no-avx2-csv` to select the SSE2 scanner on an AVX2-capable CPU.
 
+For dedup buckets containing at least 1,024 records, two small bitmaps prove
+which 16-bit hash fingerprints occur exactly once. Those rows can bypass the
+dedup table. Shared fingerprints always go through exact ID comparison and
+earliest-ingest selection. Five alternating pinned trials gave **2.678 s**
+versus **2.837 s** with all rows entering the table. Every run matched, including
+the official dev output and a duplicate-heavy test with an invalid winner.
+Use `--no-sparse-duplicates` for the ordinary dedup table.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
