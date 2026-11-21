@@ -8,6 +8,12 @@ template<class V> class FlatMap {
     using Slot=std::pair<SV,V>;
     std::vector<Slot> slots;
     size_t used=0;
+    static size_t bucket(SV key,size_t mask) {
+        auto h=Hash{}(key);
+        // Partitioning already fixes the low hash bits. Reusing those bits
+        // here creates long probe clusters inside every partition.
+        return (h^(h>>32))&mask;
+    }
 public:
     void reserve(size_t n) {
         size_t capacity=16;
@@ -19,7 +25,7 @@ public:
     std::pair<Slot*,bool> try_emplace(SV key,V value) {
         if(!key.data())throw std::runtime_error("null string_view key");
         if((used+1)*3>=slots.size()*2)reserve(used+1);
-        size_t at=Hash{}(key)&(slots.size()-1);
+        size_t at=bucket(key,slots.size()-1);
         while(slots[at].first.data()) {
             if(slots[at].first==key)return {&slots[at],false};
             at=(at+1)&(slots.size()-1);
@@ -28,7 +34,7 @@ public:
     }
     Slot* find(SV key) {
         if(slots.empty())return nullptr;
-        size_t at=Hash{}(key)&(slots.size()-1);
+        size_t at=bucket(key,slots.size()-1);
         while(slots[at].first.data()) {
             if(slots[at].first==key)return &slots[at];
             at=(at+1)&(slots.size()-1);

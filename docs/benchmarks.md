@@ -30,9 +30,17 @@ Every timed output exactly matches the single-thread reference output.
 | Flat-table dedup + compact IDs, 64 partitions, 8 threads | 16.868 |
 | DuckDB Ska Sort + compact IDs + hash dedup, 256 partitions | **12.462** |
 | Above + ported DuckDB HashBytes | **12.429** |
+| Corrected flat-table bucket hash + dense totals | **8.736** |
 
-The new best's three runs were 13.295, 12.462, and 12.055 seconds, all exact
-matches. This configuration is the production default. The improvement over
+The 8.736-second record uses flat deduplication, 256 partitions, compact IDs,
+ported DuckDB sorting/hashing, and dense campaign totals. Its three runs were
+8.736, 8.865, and 8.685 seconds, all exact matches. Peak RSS was about 3.8 GiB.
+This is the current production default. Fixing secondary hash selection avoids
+probe clusters caused by the fixed partition hash bits. Campaign totals use
+arrays indexed by day and campaign instead of repeated tree-map lookups.
+
+The sorter-only record's three runs were 13.295, 12.462, and 12.055 seconds, all exact
+matches. The improvement over
 12.789 seconds is small relative to local timing variation and needs confirmation
 on the official scorer; it is a verified local record, not a leaderboard result.
 

@@ -10,6 +10,7 @@ struct Event {SV person;int64_t ts;uint32_t price,category;};
 struct Click {SV person,id;int64_t ts;uint32_t campaign;};
 struct CompactClick {SV id;int64_t ts;uint32_t campaign,person;};
 struct Aggregate {int64_t sessions=0,purchasing=0,revenue=0,assisted=0;};
+struct WorkProfile {double gather=0,intern=0,sort=0,aggregate=0,parquet=0;};
 using CampaignTotals=std::map<std::pair<int64_t,uint32_t>,Aggregate>;
 template<class T> using Buckets=std::vector<std::vector<T>>;
 template<class T> using Workers=std::vector<Buckets<T>>;
@@ -20,7 +21,8 @@ struct Options {
     bool baseline=false;
     bool compact=true;
     bool flat_links=false;
-    std::string dedup="hash";
+    bool dense_totals=true;
+    std::string dedup="flat";
     std::string sorter="duckdb";
 };
 Options options(int argc,char** argv) {
@@ -35,6 +37,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--compact")o.compact=true;
         else if(arg=="--no-compact")o.compact=false;
         else if(arg=="--flat-links")o.flat_links=true;
+        else if(arg=="--dense-totals")o.dense_totals=true;
+        else if(arg=="--no-dense-totals")o.dense_totals=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup"&&i+1<argc)o.dedup=argv[++i];
@@ -45,7 +49,7 @@ Options options(int argc,char** argv) {
         else if(positional==2)o.out=arg;
         else throw std::runtime_error("too many paths");
     }
-    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.sorter="std";}
+    if(o.baseline){o.threads=1;o.shards=1;o.dedup="sort";o.compact=false;o.flat_links=false;o.dense_totals=false;o.sorter="std";}
     if(o.threads<1||o.threads>256||o.shards<1||o.shards>4096||(o.shards&(o.shards-1)))throw std::runtime_error("threads must be 1..256; shards a power of two in 1..4096");
     if(o.dedup!="sort"&&o.dedup!="hash"&&o.dedup!="flat")throw std::runtime_error("dedup must be sort, hash, or flat");
     if(o.sorter!="std"&&o.sorter!="duckdb")throw std::runtime_error("sorter must be std or duckdb");
@@ -63,8 +67,12 @@ struct Pipeline {
     Workers<Event> events;
     Workers<Click> clicks;
     std::vector<CampaignTotals> totals;
+    std::vector<std::vector<Aggregate>> dense_totals;
+    std::vector<WorkProfile> profiles;
     explicit Pipeline(Options options):o(std::move(options)),raw(o.threads,Buckets<Raw>(o.shards)),
-        events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads){}
+        events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
+    using Clock=std::chrono::steady_clock;
+    static double elapsed(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
     size_t shard(SV s)const{return Hash{}(s)&(o.shards-1);}
     void load() {
         std::ifstream mf(o.data/"manifest.json");
@@ -91,6 +99,11 @@ struct Pipeline {
             std::array<SV,2> f;if(!csv(line,f))throw std::runtime_error("malformed campaigns.csv");
             campaigns.emplace(f[0],campaign_names.size());campaign_names.push_back(f[0]);channels.push_back(f[1]);
         });
+        if(o.dense_totals) {
+            auto days=dayof(end-1)-dayof(start)+1;
+            dense_totals.resize(o.threads);
+            for(auto& t:dense_totals)t.resize(size_t(days)*campaign_names.size());
+        }
         for(auto p:files(o.data/"links"))in.add(p,in.links);
         for(auto chunk:in.links)Inputs::lines(chunk,[&](SV line){
             std::array<SV,2> f;if(csv(line,f)&&!f[0].empty()&&!f[1].empty())people.join(f[0],f[1]);
@@ -114,6 +127,10 @@ struct Pipeline {
     SV canonical(SV s)const {
         if(!o.flat_links)return people.person(s);
         auto it=person_lookup.find(s);return it==person_lookup.end()?s:people.names[it->second];
+    }
+    Aggregate& total(int worker,int64_t day,uint32_t campaign) {
+        if(o.dense_totals)return dense_totals[worker][size_t(day-dayof(start))*campaign_names.size()+campaign];
+        return totals[worker][{day,campaign}];
     }
     void parse_events() {
         parallel(in.events.size(),o.threads,[&](size_t i,int worker){
@@ -173,7 +190,9 @@ struct Pipeline {
     }
     void sessionize() {
         parallel(o.shards,o.threads,[&](size_t s,int worker){
+            auto before=Clock::now();
             auto ev=gather(events,s);auto cl=gather(clicks,s);
+            profiles[worker].gather+=elapsed(before);before=Clock::now();
             if(o.compact) {
                 FlatMap<uint32_t> codes;
                 std::vector<SV> names;
@@ -190,11 +209,16 @@ struct Pipeline {
                     if(it!=codes.end())compact_clicks.push_back({c.id,c.ts,c.campaign,it->second});
                 }
                 std::vector<Click>().swap(cl);
+                profiles[worker].intern+=elapsed(before);
                 process(s,worker,compact_events,compact_clicks,[&](uint32_t code){return names[code];});
             } else process(s,worker,ev,cl,[](SV person){return person;});
         });
+        WorkProfile sum;
+        for(auto p:profiles){sum.gather+=p.gather;sum.intern+=p.intern;sum.sort+=p.sort;sum.aggregate+=p.aggregate;sum.parquet+=p.parquet;}
+        std::cerr<<"session_work_seconds gather="<<sum.gather<<" intern="<<sum.intern<<" sort="<<sum.sort<<" aggregate="<<sum.aggregate<<" parquet="<<sum.parquet<<'\n';
     }
     template<class E,class C,class Name> void process(size_t s,int worker,std::vector<E>& ev,std::vector<C>& cl,Name name) {
+            auto before=Clock::now();
             auto event_less=[](auto& a,auto& b){return a.person!=b.person?a.person<b.person:a.ts<b.ts;};
             if(o.sorter=="duckdb") {
                 if constexpr(std::is_same_v<E,CompactEvent>) {
@@ -205,6 +229,7 @@ struct Pipeline {
             auto click_less=[](auto& a,auto& b){return a.person!=b.person?a.person<b.person:(a.ts!=b.ts?a.ts<b.ts:a.id>b.id);};
             if(o.sorter=="duckdb")duckdb_pdqsort::pdqsort(cl.begin(),cl.end(),click_less);
             else std::sort(cl.begin(),cl.end(),click_less);
+            profiles[worker].sort+=elapsed(before);before=Clock::now();
             using parquet::Column;
             std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",2},{"events",2},{"revenue_cents",2},{"top_category",6,true}};
             size_t cb=0;
@@ -236,22 +261,31 @@ struct Pipeline {
                         // Intentionally simple oracle: rescan clicks per session.
                         std::unordered_map<uint32_t,bool> assisted;
                         for(size_t k=cb;k<ce;++k)if(cl[k].ts<=st&&cl[k].ts>=st-WEEK){credited=cl[k].campaign;assisted[credited]=true;}
-                        for(auto [cam,unused]:assisted)++totals[worker][{sd,cam}].assisted;
+                        for(auto [cam,unused]:assisted)++total(worker,sd,cam).assisted;
                     } else {
                         while(hi<ce&&cl[hi].ts<=st){++active[cl[hi].campaign];++hi;}
                         while(lo<hi&&cl[lo].ts<st-WEEK){auto it=active.find(cl[lo].campaign);if(!--it->second)active.erase(it);++lo;}
                         if(hi>lo)credited=cl[hi-1].campaign;
-                        for(auto [cam,count]:active)++totals[worker][{sd,cam}].assisted;
+                        for(auto [cam,count]:active)++total(worker,sd,cam).assisted;
                     }
-                    auto& total=totals[worker][{sd,credited}];++total.sessions;total.purchasing+=revenue>0;total.revenue+=revenue;
+                    auto& credited_total=total(worker,sd,credited);++credited_total.sessions;credited_total.purchasing+=revenue>0;credited_total.revenue+=revenue;
                     i=j;
                 }
                 flush();cb=ce;begin=finish;
             }
+            profiles[worker].aggregate+=elapsed(before);before=Clock::now();
             if(cols[0].count||s==0)parquet::write((o.out/"user_daily"/("part-"+std::to_string(s)+".parquet")).string(),cols);
+            profiles[worker].parquet+=elapsed(before);
     }
     void campaigns_output() {
         CampaignTotals all;
+        if(o.dense_totals) {
+            for(size_t i=0;i<dense_totals[0].size();++i) {
+                Aggregate a;
+                for(auto& w:dense_totals){const auto& t=w[i];a.sessions+=t.sessions;a.purchasing+=t.purchasing;a.revenue+=t.revenue;a.assisted+=t.assisted;}
+                if(a.sessions||a.assisted)all[{dayof(start)+i/campaign_names.size(),i%campaign_names.size()}]=a;
+            }
+        }
         for(auto& worker:totals)for(auto [key,t]:worker){auto& a=all[key];a.sessions+=t.sessions;a.purchasing+=t.purchasing;a.revenue+=t.revenue;a.assisted+=t.assisted;}
         using parquet::Column;
         std::vector<Column> cols={{"campaign_id",6},{"channel",6},{"day",1,false,true},{"sessions",2},{"purchasing_sessions",2},{"revenue_cents",2},{"assisted_sessions",2}};
