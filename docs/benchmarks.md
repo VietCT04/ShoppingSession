@@ -128,6 +128,13 @@ Five alternating 20M trials gave medians of **4.104 s** for the new parser and
 entrypoint also matched the official 1M answers and the 20M reference.
 Use `--no-fast-time` to reproduce the generic parser path.
 
+Storing grouped events in 16 bytes with a timestamp relative to the manifest
+start gave a **4.097 s** median versus **4.347 s** with 24-byte events in five
+alternating 20M trials. All outputs matched. The code selects the 64-bit layout
+automatically when the window cannot fit in a 32-bit millisecond offset. Click
+timestamps remain absolute so clicks before the event window still qualify.
+Use `--wide-events` to force the 24-byte path.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
