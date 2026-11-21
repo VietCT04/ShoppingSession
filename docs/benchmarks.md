@@ -289,3 +289,9 @@ scanner, with a median peak RSS reduction of 131 MiB. Every timed result and a
 separate run using production defaults matched the reference. The fixture
 matrix, dev answers, and fallbacks for long windows and large category tables
 passed. Use `--wide-routing` to compare the previous layout.
+
+The link graph now uses the fused CSV scanner and preallocates its tables from
+a bounded count of input lines. The full 20M medians were **1.779 vs. 1.846
+seconds** in the three-pair trial and **1.825 vs. 1.862 seconds** across five
+pairs in the repeat. Each output matched exactly. The earlier link path is
+available with `--legacy-link-input`.
