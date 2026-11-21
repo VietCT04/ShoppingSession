@@ -330,3 +330,8 @@ ranges, resolves each alias once, and merges only the ranges that belong to
 the same canonical person. The five-pair median improved from **1.723 to
 1.638 seconds** on 20M, with exact matches in both tables for every run. Use
 `--no-redirect-linked-groups` to benchmark per-record alias resolution.
+
+A separate pinned five-pair run on the same production source measured a
+**1.334-second** median for the ordinary build and **1.544 seconds** for the
+profile-guided build. Both builds matched the full 20M reference on every
+run. Wall times within the batch varied from 1.287 to 1.690 seconds.
