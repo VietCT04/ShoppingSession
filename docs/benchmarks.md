@@ -275,3 +275,9 @@ All 20 timed outputs, the default 20M run, and the official dev results
 matched exactly. All 684 fixture/configuration checks and the randomized CSV
 checks passed. The row scanner is selected automatically when supported.
 `--no-row-csv` selects the previous scanner for comparison.
+
+Building the row scanner with profile-guided optimization yielded the fastest
+local median so far, **1.403 seconds** for the full 20M input, compared with
+**1.534 seconds** for the standard build in the same five-pair batch. The
+profile used the separate 1M dev input. The faster build matched every large
+reference output, all 36 official fixtures, and the official dev answers.
