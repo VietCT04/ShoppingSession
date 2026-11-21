@@ -184,6 +184,16 @@ time keeps its original width. Long windows and dictionaries with more than
 20M runs measured **2.597 s** versus **2.669 s**, all exact. Peak RSS was about
 3,520 MiB versus 3,745 MiB. Use `--wide-raw` to force the wider layout.
 
+The AMD64 build packs IDs of up to nine nonzero ASCII bytes into 63 bits.
+Longer IDs and other byte values retain exact mapped views. Key comparisons,
+click tie-breaking, canonical names and output text all preserve the original
+byte ordering. This reduces the compact raw event from 48 to 32 bytes and
+narrows the linked-person table. It makes no assumptions about which ID
+patterns the input contains. Five alternating pinned runs measured **2.216 s**
+versus **2.655 s**, with all outputs matching and median peak RSS about
+3,013 MiB versus 3,496 MiB. Build with `make build/shopping-packed` for the
+previous 16-byte key representation.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

@@ -2,6 +2,7 @@
 #include "../native/sort.hpp"
 #include "../native/flat_map.hpp"
 #include "../native/id.hpp"
+#include "../native/short_id.hpp"
 #include "../native/csv_scan.hpp"
 #include "../native/ingest_order.hpp"
 #include "../native/sparse_state.hpp"
@@ -42,6 +43,24 @@ int main(){try{
     require(map.try_emplace("insert after freeze",112).second&&map.find("insert after freeze")->second==112,
             "insertion invalidates read-only probe metadata");
     std::mt19937_64 rng(938151);
+    for(size_t i=0;i<30000;++i) {
+        std::string a,b;
+        size_t len=i%3?9:rng()%20;
+        for(size_t j=0;j<len;++j)a+=char(i%4?1+rng()%127:rng()%256);
+        b=a;
+        if(!b.empty()&&i%2)b[rng()%b.size()]=char(rng()%256);
+        ShortId x(a),y(b);
+        ShortId::Buffer left,right;
+        require(x.view(left)==a&&y.view(right)==b,"8-byte keys preserve exact bytes");
+        require((x==y)==(a==b)&&(x<y)==(SV(a)<SV(b)),"8-byte keys preserve lexical order");
+        if(a==b)require(ShortIdHash{}(x)==ShortIdHash{}(y),"equal 8-byte keys hash equally");
+    }
+    {
+        std::string large(40000,'A');
+        ShortId key(large);
+        ShortId::Buffer buffer;
+        require(key.view(buffer)==large,"large IDs retain complete mapped field");
+    }
     {
         StrictTimeParser parser;parser.init(timestamp("2028-02-20T00:00:00Z"),timestamp("2028-03-05T00:00:00Z"));
         for(size_t i=0;i<300000;++i) {

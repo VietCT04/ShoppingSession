@@ -3,6 +3,7 @@
 #include "flat_map.hpp"
 #include "sort.hpp"
 #include "id.hpp"
+#include "short_id.hpp"
 #include "csv_scan.hpp"
 #include "ingest_order.hpp"
 #include "sparse_state.hpp"
@@ -16,14 +17,24 @@
 #ifndef SHOP_VIEW_IDS
 #define SHOP_PACKED_IDS
 #endif
+#if defined(__x86_64__) && !defined(SHOP_WIDE_IDS) && !defined(SHOP_VIEW_IDS) && !defined(SHOP_SHORT_IDS)
+#define SHOP_SHORT_IDS
+#endif
 
 using namespace shop;
 #ifdef SHOP_PACKED_IDS
+#ifdef SHOP_SHORT_IDS
+using Key=ShortId;
+using KeyHash=ShortIdHash;
+using PeopleType=PackedPeopleFor<Key,KeyHash>;
+SV text(const Key& key,ShortId::Buffer& buffer){return key.view(buffer);}
+#else
 using Key=Id;using KeyHash=IdHash;using PeopleType=PackedPeople;
-SV text(const Id& s){return s.view();}
+SV text(const Id& s,ShortId::Buffer&){return s.view();}
+#endif
 #else
 using Key=SV;using KeyHash=Hash;using PeopleType=People;
-SV text(SV s){return s;}
+SV text(SV s,ShortId::Buffer&){return s;}
 #endif
 template<class V>using KeyDict=std::unordered_map<Key,V,KeyHash>;
 template<class V>using KeyFlatMap=FlatMap<V,Key,KeyHash>;
@@ -39,7 +50,7 @@ struct CompactRaw {
     static constexpr uint32_t invalid=UINT32_MAX;
     static constexpr uint32_t price_mask=(1u<<24)-1;
 };
-static_assert(sizeof(CompactRaw)==48);
+static_assert(sizeof(CompactRaw)==2*sizeof(Key)+16);
 struct Event {
     Key person;int64_t ts;uint32_t price,category;
     bool operator<(const Event& b)const{return person!=b.person?person<b.person:ts<b.ts;}
@@ -240,7 +251,7 @@ struct Pipeline {
     }
     void build_links() {
         for(auto chunk:in.links)Inputs::lines(chunk,[&](SV line){
-            std::array<SV,2> f;if(csv(line,f)&&!f[0].empty()&&!f[1].empty())people.join(f[0],f[1]);
+            std::array<SV,2> f;if(csv(line,f)&&!f[0].empty()&&!f[1].empty())people.join(Key(f[0]),Key(f[1]));
         });
         people.finish();
 #ifdef SHOP_PACKED_IDS
@@ -595,7 +606,9 @@ struct Pipeline {
             CampaignWindow campaign_window(o.array_active?campaign_names.size():0);
             CategoryRevenue category_revenue(o.array_categories?categories.size():0);
             for(size_t begin=0;begin<ev.size();) {
-                size_t finish=begin+1;auto person_key=ev[begin].person;auto person_name=name(person_key);SV person=text(person_name);
+                size_t finish=begin+1;auto person_key=ev[begin].person;auto person_name=name(person_key);
+                ShortId::Buffer decoded_name;
+                SV person=text(person_name,decoded_name);
                 while(finish<ev.size()&&ev[finish].person==person_key)++finish;
                 while(cb<cl.size()&&cl[cb].person<person_key)++cb;
                 size_t ce=cb;while(ce<cl.size()&&cl[ce].person==person_key)++ce;

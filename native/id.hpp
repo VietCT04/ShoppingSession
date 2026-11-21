@@ -42,21 +42,22 @@ struct IdHash {
         h^=h>>32;h*=0xd6e8feb86659fd93ULL;h^=h>>32;h*=0xd6e8feb86659fd93ULL;return h^(h>>32);
     }
 };
-struct PackedPeople {
-    FlatMap<uint32_t,Id,IdHash> index;
+template<class Key,class Hasher> struct PackedPeopleFor {
+    FlatMap<uint32_t,Key,Hasher> index;
     std::vector<uint32_t> parents,sizes;
-    std::vector<Id> names;
-    uint32_t id(Id s) {
+    std::vector<Key> names;
+    uint32_t id(Key s) {
         auto [it,added]=index.try_emplace(s,index.size());
         if(added){parents.push_back(it->second);sizes.push_back(1);names.push_back(s);}return it->second;
     }
     uint32_t root(uint32_t n){while(parents[n]!=n){parents[n]=parents[parents[n]];n=parents[n];}return n;}
-    void join(Id a,Id b) {
+    void join(Key a,Key b) {
         auto x=root(id(a)),y=root(id(b));if(x==y)return;
         if(sizes[x]<sizes[y])std::swap(x,y);
         parents[y]=x;sizes[x]+=sizes[y];if(names[y]<names[x])names[x]=names[y];
     }
-    void finish(){index.each_mutable([&](Id,uint32_t& n){n=root(n);});}
-    Id person(Id s)const{auto it=index.find(s);return it==index.end()?s:names[it->second];}
+    void finish(){index.each_mutable([&](Key,uint32_t& n){n=root(n);});}
+    Key person(Key s)const{auto it=index.find(s);return it==index.end()?s:names[it->second];}
 };
+using PackedPeople=PackedPeopleFor<Id,IdHash>;
 }

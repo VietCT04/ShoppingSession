@@ -160,6 +160,7 @@ int main(int argc,char** argv) {
             configs.back().flags.push_back("--sparse-duplicates");
             configs.push_back({"compact-raw",configs.back().flags});
             configs.back().flags.push_back("--compact-raw");
+            if(std::getenv("BINARY_SHORT"))configs.push_back({"short-ids",configs.back().flags});
             configs.push_back({"heavy-shards",tier_control});
             configs.back().flags.push_back("--heavy-shards-first");
             configs.push_back({"ingest-1024",ingest_control});
@@ -183,7 +184,7 @@ int main(int argc,char** argv) {
             std::vector<std::vector<double>> times(configs.size());
             auto measure=[&](size_t index,int i) {
                     auto& config=configs[index];
-                    const char* binary=std::getenv("BINARY");
+                    const char* binary=std::getenv(config.name=="short-ids"?"BINARY_SHORT":"BINARY");
                     std::vector<std::string> args={binary?binary:"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
                     // Matrix entries start from fixed defaults rather than the
                     // tuned production defaults. Explicit flags override these.
