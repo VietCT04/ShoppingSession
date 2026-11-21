@@ -66,7 +66,11 @@ Run run(std::vector<std::string> args,const fs::path& log) {
     int status=0;struct rusage usage{};
     if(wait4(pid,&status,0,&usage)<0)throw std::runtime_error("wait4 failed");
     double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
-    if(!WIFEXITED(status)||WEXITSTATUS(status))throw std::runtime_error("pipeline failed; see "+log.string());
+    if(!WIFEXITED(status)||WEXITSTATUS(status)) {
+        std::ifstream file(log);std::string output((std::istreambuf_iterator<char>(file)),{});
+        if(output.size()>4000)output.erase(0,output.size()-4000);
+        throw std::runtime_error("pipeline failed; see "+log.string()+"\n"+output);
+    }
     return {seconds,usage.ru_maxrss};
 }
 int main(int argc,char** argv) {
@@ -75,11 +79,14 @@ int main(int argc,char** argv) {
         std::string mode=argv[1];Database db;
         if(mode=="compare"&&argc==4){compare(db,argv[2],argv[3]);std::cout<<"MATCH\n";}
         else if(mode=="fixtures") {
-            fs::create_directories("build/fixture-output");int cases=0;
+            fs::path fixture_output=std::getenv("FIXTURE_SINGLE")?"build/production-fixture-output":"build/fixture-output";
+            fs::create_directories(fixture_output);int cases=0;
             std::vector<fs::path> paths;for(auto& p:fs::directory_iterator("fixtures"))if(p.is_directory())paths.push_back(p.path());std::sort(paths.begin(),paths.end());
-            for(const auto& p:paths)for(std::string config:{"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense","dense-person-dense","flat-person-dense-fused"}) {
-                std::vector<std::string> args={argc>2?argv[2]:"build/shopping",(p/"input").string(),"build/fixture-output"};
-                if(config=="baseline")args.push_back("--baseline");else {
+            std::vector<std::string> fixture_configs={"baseline","sort","hash","flat","hash-compact","flat-compact","hash-duckdb","hash-compact-duckdb","hash-compact-duckdb-frozen","hash-compact-duckdb-dense","hash-person-dense","dense-person-dense","flat-person-dense-fused"};
+            if(std::getenv("FIXTURE_SINGLE"))fixture_configs={"production"};
+            for(const auto& p:paths)for(std::string config:fixture_configs) {
+                std::vector<std::string> args={argc>2?argv[2]:"build/shopping",(p/"input").string(),fixture_output.string()};
+                if(config=="baseline")args.push_back("--baseline");else if(config!="production") {
                     args.push_back("--no-compact");args.push_back("--no-fused-csv");args.push_back("--no-group-person");args.push_back("--no-dense-totals");args.push_back("--sorter");args.push_back("std");
                     args.push_back("--dedup");args.push_back(config.substr(0,config.find('-')));
                     if(config.find("compact")!=std::string::npos)args.push_back("--compact");
@@ -89,7 +96,7 @@ int main(int argc,char** argv) {
                     if(config.find("person")!=std::string::npos)args.push_back("--group-person");
                     if(config.ends_with("-fused")){args.push_back("--fused-csv");args.push_back("--dense-totals");}
                 }
-                run(args,"build/fixture.log");compare(db,"build/fixture-output",p/"expected");
+                run(args,"build/fixture.log");compare(db,fixture_output,p/"expected");
                 std::cout<<"PASS "<<p.filename().string()<<" "<<config<<'\n';++cases;
             }
             std::cout<<cases<<" fixture/config checks passed\n";
