@@ -26,7 +26,7 @@ using namespace shop;
 #ifdef SHOP_SHORT_IDS
 using Key=ShortId;
 using KeyHash=ShortIdHash;
-using PeopleType=PackedPeopleFor<Key,KeyHash>;
+using PeopleType=PackedPeopleFor<Key,KeyHash,true>;
 SV text(const Key& key,ShortId::Buffer& buffer){return key.view(buffer);}
 #else
 using Key=Id;using KeyHash=IdHash;using PeopleType=PackedPeople;
@@ -110,6 +110,7 @@ struct Options {
     bool tag_links=true,heavy_shards_first=false;
     bool sparse_duplicates=true;
     bool compact_raw=true;
+    bool inline_short_links=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -155,6 +156,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-sparse-duplicates")o.sparse_duplicates=false;
         else if(arg=="--compact-raw")o.compact_raw=true;
         else if(arg=="--wide-raw")o.compact_raw=false;
+        else if(arg=="--inline-short-links")o.inline_short_links=true;
+        else if(arg=="--no-inline-short-links")o.inline_short_links=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -253,7 +256,11 @@ struct Pipeline {
         for(auto chunk:in.links)Inputs::lines(chunk,[&](SV line){
             std::array<SV,2> f;if(csv(line,f)&&!f[0].empty()&&!f[1].empty())people.join(Key(f[0]),Key(f[1]));
         });
+#ifdef SHOP_SHORT_IDS
+        people.finish(o.inline_short_links);
+#else
         people.finish();
+#endif
 #ifdef SHOP_PACKED_IDS
         if(o.tag_links)people.index.freeze();
 #endif

@@ -194,6 +194,13 @@ versus **2.655 s**, with all outputs matching and median peak RSS about
 3,013 MiB versus 3,496 MiB. Build with `make build/shopping-packed` for the
 previous 16-byte key representation.
 
+With eight-byte keys, a canonical key fits in the space already occupied by
+the root index and slot padding. The linker replaces root indices in place
+and releases the graph arrays, so a hit no longer loads a separate root name.
+The five-run pinned median was **2.084 s** versus **2.236 s**. Every trial
+matched the reference. Use `--no-inline-short-links` to retain the root-name
+lookup when benchmarking.
+
 The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
 matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
 an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.

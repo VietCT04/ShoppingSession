@@ -42,10 +42,12 @@ struct IdHash {
         h^=h>>32;h*=0xd6e8feb86659fd93ULL;h^=h>>32;h*=0xd6e8feb86659fd93ULL;return h^(h>>32);
     }
 };
-template<class Key,class Hasher> struct PackedPeopleFor {
-    FlatMap<uint32_t,Key,Hasher> index;
+template<class Key,class Hasher,bool CanInline=false> struct PackedPeopleFor {
+    using IndexValue=std::conditional_t<CanInline,uint64_t,uint32_t>;
+    FlatMap<IndexValue,Key,Hasher> index;
     std::vector<uint32_t> parents,sizes;
     std::vector<Key> names;
+    bool inlined=false;
     uint32_t id(Key s) {
         auto [it,added]=index.try_emplace(s,index.size());
         if(added){parents.push_back(it->second);sizes.push_back(1);names.push_back(s);}return it->second;
@@ -56,8 +58,31 @@ template<class Key,class Hasher> struct PackedPeopleFor {
         if(sizes[x]<sizes[y])std::swap(x,y);
         parents[y]=x;sizes[x]+=sizes[y];if(names[y]<names[x])names[x]=names[y];
     }
-    void finish(){index.each_mutable([&](Key,uint32_t& n){n=root(n);});}
-    Key person(Key s)const{auto it=index.find(s);return it==index.end()?s:names[it->second];}
+    void finish(bool resolve_inline=false) {
+        if constexpr(CanInline) {
+            if(resolve_inline) {
+                index.each_mutable([&](Key,IndexValue& n){n=names[root(uint32_t(n))].word;});
+                inlined=true;
+                std::vector<Key>().swap(names);
+                std::vector<uint32_t>().swap(parents);
+                std::vector<uint32_t>().swap(sizes);
+                return;
+            }
+        }
+        index.each_mutable([&](Key,IndexValue& n){n=root(uint32_t(n));});
+    }
+    Key person(Key s)const {
+        auto it=index.find(s);
+        if(it==index.end())return s;
+        if constexpr(CanInline) {
+            if(inlined) {
+                Key canonical;
+                canonical.word=it->second;
+                return canonical;
+            }
+        }
+        return names[it->second];
+    }
 };
 using PackedPeople=PackedPeopleFor<Id,IdHash>;
 }
