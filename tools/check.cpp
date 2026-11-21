@@ -114,6 +114,7 @@ int main(int argc,char** argv) {
             configs.push_back({"duckdb-flat-8-1024",{"--threads","8","--shards","1024","--dedup","flat","--sorter","duckdb","--compact"}});
             configs.push_back({"duckdb-dense-8-256",{"--threads","8","--shards","256","--dedup","hash","--sorter","duckdb","--compact","--dense-totals"}});
             configs.push_back({"duckdb-flat-dense-8-256",{"--threads","8","--shards","256","--dedup","flat","--sorter","duckdb","--compact","--dense-totals"}});
+            configs.push_back({"packed-8-256",{"--threads","8","--shards","256","--dedup","flat","--sorter","duckdb","--no-compact","--dense-totals"}});
             // SKIP_BASELINE is useful when timing large datasets against a
             // previously computed oracle. Correctness remains mandatory.
             if(std::getenv("SKIP_BASELINE"))configs.erase(configs.begin());
@@ -123,7 +124,8 @@ int main(int argc,char** argv) {
             for(auto config:configs) {
                 std::vector<double> times;
                 for(int i=0;i<repeats;++i) {
-                    std::vector<std::string> args={"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
+                    const char* binary=std::getenv("BINARY");
+                    std::vector<std::string> args={binary?binary:"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
                     // Matrix entries start from fixed defaults rather than the
                     // tuned production defaults. Explicit flags override these.
                     args.insert(args.begin()+3,{"--no-compact","--no-dense-totals","--sorter","std"});

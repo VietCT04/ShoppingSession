@@ -1,6 +1,7 @@
 #include "../native/core.hpp"
 #include "../native/sort.hpp"
 #include "../native/flat_map.hpp"
+#include "../native/id.hpp"
 #include <cstdlib>
 #include <random>
 using namespace shop;
@@ -31,6 +32,19 @@ int main(){try{
     for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
     require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
     std::mt19937_64 rng(938151);
+    for(size_t round=0;round<200000;++round) {
+        std::string a,b;
+        for(size_t i=0,n=rng()%40;i<n;++i)a+=char(rng()%256);
+        if(round%2)b=a;else for(size_t i=0,n=rng()%40;i<n;++i)b+=char(rng()%256);
+        Id x(a),y(b),copy=x;
+        require(x.view()==a&&copy.view()==a&&y.view()==b,"packed ID exact storage and copy");
+        require((x==y)==(a==b)&&(x<y)==(SV(a)<SV(b)),"packed ID byte order and equality");
+        if(x==y)require(IdHash{}(x)==IdHash{}(y),"equal packed IDs hash equally");
+    }
+    PackedPeople packed_people;
+    packed_people.join(Id("long-id-with-more-than-15-bytes"),Id("u1"));
+    packed_people.join(Id("u1"),Id("A"));packed_people.join(Id("A"),Id("é"));packed_people.finish();
+    require(packed_people.person(Id("long-id-with-more-than-15-bytes")).view()=="A","packed union-find minimum");
     for(size_t round=0;round<200000;++round) {
         const char alphabet[]="ab\"\",,, 0123\t\rXYZ";
         std::string line;size_t length=rng()%150;

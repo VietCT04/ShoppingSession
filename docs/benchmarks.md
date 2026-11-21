@@ -32,6 +32,13 @@ Every timed output exactly matches the single-thread reference output.
 | Above + ported DuckDB HashBytes | **12.429** |
 | Corrected flat-table bucket hash + dense totals | **8.736** |
 | Above + SSE2 CSV special-character scanning | **8.534** |
+| Inline 128-bit IDs, direct sorting, no ID interning | **5.498** |
+
+The packed-ID record's three runs were 4.915, 5.498, and 5.801 seconds, all
+matching the original baseline. IDs up to 15 bytes live inline; longer IDs keep
+an exact mapped view. Both paths preserve arbitrary bytes and byte-wise order.
+The new default removes the intermediate user-ID interning pass. The old
+string-view implementation remains available as `make build/shopping-view`.
 
 The SIMD candidate ran in 8.398, 8.534, and 8.630 seconds, all exact matches.
 It also passes 200K randomized scalar-versus-SIMD CSV comparisons and the full

@@ -106,8 +106,10 @@ performance from the 1M-event dataset alone.
 for each session. It shares parsing and event validation, but uses a simpler
 attribution algorithm as a differential oracle. `--dedup sort|hash|flat`,
 `--shards N`, `--compact|--no-compact`, and `--sorter std|duckdb` expose the
-optimizations for measurement. Defaults: 256 partitions, flat dedup, compact IDs,
-the ported DuckDB sorter, and dense campaign totals. `--no-dense-totals` restores
+optimizations for measurement. Defaults: 256 partitions, flat dedup, inline IDs,
+direct DuckDB component sorting, and dense campaign totals. IDs longer than 15
+bytes use an exact general path. `--compact` enables intermediate integer IDs
+for comparison. `--no-dense-totals` restores
 map aggregation for comparison.
 
 ## Submission container

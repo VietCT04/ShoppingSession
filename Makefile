@@ -12,6 +12,10 @@ NATIVE_HEADERS := $(wildcard native/*.hpp)
 
 .PHONY: all baseline run fixtures check-dev dev benchmark clean docker test
 all: $(BUILD)/shopping
+$(BUILD)/shopping-packed: native/main.cpp $(NATIVE_HEADERS) $(wildcard third_party/duckdb_sort/*.h*) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DSHOP_PACKED_IDS native/main.cpp -o $@
+$(BUILD)/shopping-view: native/main.cpp $(NATIVE_HEADERS) $(wildcard third_party/duckdb_sort/*.h*) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DSHOP_VIEW_IDS native/main.cpp -o $@
 $(BUILD)/check: tools/check.cpp $(NATIVE_HEADERS) | $(BUILD)
 	sh scripts/bootstrap-validator.sh
 	$(CXX) $(CXXFLAGS) -Ibuild/vendor tools/check.cpp -Lbuild/vendor -lduckdb -Wl,-rpath,'$$ORIGIN/vendor' -o $@

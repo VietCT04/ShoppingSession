@@ -2,13 +2,38 @@
 #include "parquet.hpp"
 #include "flat_map.hpp"
 #include "sort.hpp"
+#include "id.hpp"
 #include <cstdlib>
+#ifndef SHOP_VIEW_IDS
+#define SHOP_PACKED_IDS
+#endif
 
 using namespace shop;
-struct Raw {SV id,person;int64_t ts,ingest;uint32_t price,category;};
-struct Event {SV person;int64_t ts;uint32_t price,category;};
-struct Click {SV person,id;int64_t ts;uint32_t campaign;};
-struct CompactClick {SV id;int64_t ts;uint32_t campaign,person;};
+#ifdef SHOP_PACKED_IDS
+using Key=Id;using KeyHash=IdHash;using PeopleType=PackedPeople;
+SV text(const Id& s){return s.view();}
+#else
+using Key=SV;using KeyHash=Hash;using PeopleType=People;
+SV text(SV s){return s;}
+#endif
+template<class V>using KeyDict=std::unordered_map<Key,V,KeyHash>;
+template<class V>using KeyFlatMap=FlatMap<V,Key,KeyHash>;
+struct Raw {Key id,person;int64_t ts,ingest;uint32_t price,category;};
+struct Event {
+    Key person;int64_t ts;uint32_t price,category;
+    bool operator<(const Event& b)const{return person!=b.person?person<b.person:ts<b.ts;}
+};
+struct Click {Key person,id;int64_t ts;uint32_t campaign;};
+#ifdef SHOP_PACKED_IDS
+struct PackedEventSortKey {
+    bool requires_next_sort=true;
+    static constexpr size_t ska_sort_width=8;
+    bool Interrupted()const{return false;}
+    bool ByteIsSkippable(size_t)const{return false;}
+    uint64_t operator()(const Event& e)const{return e.person.prefix();}
+};
+#endif
+struct CompactClick {Key id;int64_t ts;uint32_t campaign,person;};
 struct Aggregate {int64_t sessions=0,purchasing=0,revenue=0,assisted=0;};
 struct WorkProfile {double gather=0,intern=0,sort=0,aggregate=0,parquet=0;};
 using CampaignTotals=std::map<std::pair<int64_t,uint32_t>,Aggregate>;
@@ -19,7 +44,11 @@ struct Options {
     fs::path data="/data",out="/output";
     int threads=8,shards=256;
     bool baseline=false;
+#ifdef SHOP_PACKED_IDS
+    bool compact=false;
+#else
     bool compact=true;
+#endif
     bool flat_links=false;
     bool dense_totals=true;
     std::string dedup="flat";
@@ -58,8 +87,8 @@ Options options(int argc,char** argv) {
 struct Pipeline {
     Options o;
     Inputs in;
-    People people;
-    FlatMap<uint32_t> person_lookup;
+    PeopleType people;
+    KeyFlatMap<uint32_t> person_lookup;
     Dict<uint32_t> products,campaigns,category_index;
     std::vector<SV> categories={"unknown"},campaign_names={"organic"},channels={"organic"};
     int64_t start,end;
@@ -73,7 +102,7 @@ struct Pipeline {
         events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
     using Clock=std::chrono::steady_clock;
     static double elapsed(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
-    size_t shard(SV s)const{return Hash{}(s)&(o.shards-1);}
+    size_t shard(Key s)const{return KeyHash{}(s)&(o.shards-1);}
     void load() {
         std::ifstream mf(o.data/"manifest.json");
         if(!mf)throw std::runtime_error("cannot open manifest.json");
@@ -109,12 +138,14 @@ struct Pipeline {
             std::array<SV,2> f;if(csv(line,f)&&!f[0].empty()&&!f[1].empty())people.join(f[0],f[1]);
         });
         people.finish();
+#ifndef SHOP_PACKED_IDS
         if(o.flat_links) {
             person_lookup.reserve(people.index.size());
             for(auto [name,root]:people.index)person_lookup.try_emplace(name,root);
             Dict<uint32_t>().swap(people.index);
             std::vector<uint32_t>().swap(people.parents);std::vector<uint32_t>().swap(people.sizes);
         }
+#endif
         for(auto p:files(o.data/"events"))in.add(p,in.events);
         for(auto p:files(o.data/"clicks"))in.add(p,in.clicks);
         fs::create_directories(o.out/"user_daily");fs::create_directories(o.out/"campaign_daily");
@@ -124,9 +155,13 @@ struct Pipeline {
     static std::vector<fs::path> files_parquet(const fs::path& dir) {
         std::vector<fs::path> r;for(auto& p:fs::directory_iterator(dir))if(p.is_regular_file()&&p.path().extension()==".parquet")r.push_back(p.path());return r;
     }
-    SV canonical(SV s)const {
+    Key canonical(Key s)const {
+#ifdef SHOP_PACKED_IDS
+        return people.person(s);
+#else
         if(!o.flat_links)return people.person(s);
         auto it=person_lookup.find(s);return it==person_lookup.end()?s:people.names[it->second];
+#endif
     }
     Aggregate& total(int worker,int64_t day,uint32_t campaign) {
         if(o.dense_totals)return dense_totals[worker][size_t(day-dayof(start))*campaign_names.size()+campaign];
@@ -148,7 +183,8 @@ struct Pipeline {
                     if(valid){auto it=products.find(f[5]);if(it!=products.end())category=it->second;}
                 }
                 if(!valid)ts=-1;
-                raw[worker][shard(f[0])].push_back({f[0],canonical(f[1]),ts,ingest,uint32_t(price),category});
+                Key event_id(f[0]);
+                raw[worker][shard(event_id)].push_back({event_id,canonical(Key(f[1])),ts,ingest,uint32_t(price),category});
             });
         });
     }
@@ -159,11 +195,11 @@ struct Pipeline {
             for(auto& w:raw){rows.insert(rows.end(),w[s].begin(),w[s].end());std::vector<Raw>().swap(w[s]);}
             auto emit=[&](const Raw& r){if(r.ts>=start)events[worker][shard(r.person)].push_back({r.person,r.ts,r.price,r.category});};
             if(o.dedup=="flat") {
-                FlatMap<size_t> winners;winners.reserve(rows.size());
+                KeyFlatMap<size_t> winners;winners.reserve(rows.size());
                 for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
-                winners.each([&](SV,size_t i){emit(rows[i]);});
+                winners.each([&](Key,size_t i){emit(rows[i]);});
             } else if(o.dedup=="hash") {
-                Dict<size_t> winners;winners.reserve(rows.size());
+                KeyDict<size_t> winners;winners.reserve(rows.size());
                 for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
                 for(auto [id,i]:winners)emit(rows[i]);
             } else {
@@ -178,7 +214,7 @@ struct Pipeline {
                 std::array<SV,4> f;if(!csv(line,f)||f[0].empty()||f[1].empty())return;
                 auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
                 auto ts=timestamp(f[3]);if(ts<start-WEEK||ts>=end)return;
-                auto p=canonical(f[1]);clicks[worker][shard(p)].push_back({p,f[0],ts,it->second});
+                auto p=canonical(Key(f[1]));clicks[worker][shard(p)].push_back({p,Key(f[0]),ts,it->second});
             });
         });
         // Identical duplicate clicks need no materialized dedup: they cannot
@@ -194,8 +230,8 @@ struct Pipeline {
             auto ev=gather(events,s);auto cl=gather(clicks,s);
             profiles[worker].gather+=elapsed(before);before=Clock::now();
             if(o.compact) {
-                FlatMap<uint32_t> codes;
-                std::vector<SV> names;
+                KeyFlatMap<uint32_t> codes;
+                std::vector<Key> names;
                 std::vector<CompactEvent> compact_events;compact_events.reserve(ev.size());
                 for(auto& e:ev) {
                     auto [it,added]=codes.try_emplace(e.person,names.size());
@@ -211,7 +247,7 @@ struct Pipeline {
                 std::vector<Click>().swap(cl);
                 profiles[worker].intern+=elapsed(before);
                 process(s,worker,compact_events,compact_clicks,[&](uint32_t code){return names[code];});
-            } else process(s,worker,ev,cl,[](SV person){return person;});
+            } else process(s,worker,ev,cl,[](Key person){return person;});
         });
         WorkProfile sum;
         for(auto p:profiles){sum.gather+=p.gather;sum.intern+=p.intern;sum.sort+=p.sort;sum.aggregate+=p.aggregate;sum.parquet+=p.parquet;}
@@ -223,7 +259,13 @@ struct Pipeline {
             if(o.sorter=="duckdb") {
                 if constexpr(std::is_same_v<E,CompactEvent>) {
                     duckdb_sort_events(ev,start,end);
-                } else duckdb_pdqsort::pdqsort(ev.begin(),ev.end(),event_less);
+                } else {
+#ifdef SHOP_PACKED_IDS
+                    if(ev.size()>1)duckdb_ska_sort::ska_sort(ev.begin(),ev.end(),PackedEventSortKey{});
+#else
+                    duckdb_pdqsort::pdqsort(ev.begin(),ev.end(),event_less);
+#endif
+                }
             } else std::sort(ev.begin(),ev.end(),event_less);
             // Within a timestamp, reverse click_id order puts the winning ID last.
             auto click_less=[](auto& a,auto& b){return a.person!=b.person?a.person<b.person:(a.ts!=b.ts?a.ts<b.ts:a.id>b.id);};
@@ -234,7 +276,7 @@ struct Pipeline {
             std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",2},{"events",2},{"revenue_cents",2},{"top_category",6,true}};
             size_t cb=0;
             for(size_t begin=0;begin<ev.size();) {
-                size_t finish=begin+1;auto person_key=ev[begin].person;SV person=name(person_key);
+                size_t finish=begin+1;auto person_key=ev[begin].person;auto person_name=name(person_key);SV person=text(person_name);
                 while(finish<ev.size()&&ev[finish].person==person_key)++finish;
                 while(cb<cl.size()&&cl[cb].person<person_key)++cb;
                 size_t ce=cb;while(ce<cl.size()&&cl[ce].person==person_key)++ce;
