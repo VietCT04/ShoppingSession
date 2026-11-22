@@ -519,3 +519,8 @@ same source measured **1.121 seconds** in the alternating batch. The fastest
 profile-guided run took **1.056 seconds**. Every output matched the full
 reference. The binary also passed all 36 fixtures, the refreshed official
 dev comparison, and a separate default-settings 20M run.
+
+Mapped-event hash records use demand-paged ingest arenas. The five-pair
+20M medians were **1.466 vs 1.489 seconds** and **1.499 vs 1.509 seconds**.
+Every output matched, and peak RSS was about 55 MiB lower. Define
+`SHOP_VECTOR_INDIRECT_EVENTS` to compare vector-backed mapped-event records.

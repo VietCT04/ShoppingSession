@@ -133,6 +133,13 @@ struct WorkProfile {double gather=0,intern=0,sort=0,aggregate=0,parquet=0;};
 using CampaignTotals=std::map<std::pair<int64_t,uint32_t>,Aggregate>;
 template<class T> using Buckets=std::vector<std::vector<T>>;
 template<class T> using Workers=std::vector<Buckets<T>>;
+#ifndef SHOP_VECTOR_INDIRECT_EVENTS
+using CachedEventStorage=IngestArena<CachedRawLocation>;
+using CachedEventBuckets=decltype(CachedEventStorage::buckets);
+#else
+using CachedEventStorage=Workers<CachedRawLocation>;
+using CachedEventBuckets=CachedEventStorage;
+#endif
 
 struct Options {
     fs::path data="/data",out="/output";
@@ -505,7 +512,7 @@ struct Pipeline {
         return type=="purchase"?2:0;
     }
     template<class R,class Buffer> void parse_events(std::vector<std::vector<Buffer>>& raw,
-                                                     [[maybe_unused]] Workers<CachedRawLocation>* indirect) {
+                                                     [[maybe_unused]] CachedEventBuckets* indirect) {
         parallel(in.events.size()+size_t(o.overlap_links),o.threads,[&](size_t i,int worker){
             if(o.overlap_links) {
                 // This job owns the link graph. The other jobs carry raw user
@@ -1263,15 +1270,31 @@ struct Pipeline {
         parquet::write((o.out/"campaign_daily"/"part-0.parquet").string(),cols);
     }
     template<class R> void ingest_and_dedup(Timer& timer) {
-        std::unique_ptr<Workers<CachedRawLocation>> indirect;
+        std::unique_ptr<CachedEventStorage> indirect_owner;
+        CachedEventBuckets* indirect=nullptr;
 #ifdef SHOP_SHORT_IDS
         if constexpr(std::is_same_v<R,NarrowRawLocation>) {
-            if(o.cache_indirect_events)
-                indirect=std::make_unique<Workers<CachedRawLocation>>(o.threads,Buckets<CachedRawLocation>(o.ingest_shards));
+            if(o.cache_indirect_events) {
+#ifndef SHOP_VECTOR_INDIRECT_EVENTS
+                if(o.raw_arena) {
+                    size_t bytes=0;
+                    for(auto chunk:in.events)bytes+=chunk.end-chunk.begin;
+                    try {
+                        indirect_owner=std::make_unique<CachedEventStorage>(o.threads,o.ingest_shards,bytes/8);
+                        indirect=&indirect_owner->buckets;
+                    } catch(const std::bad_alloc&) {
+                        // The original exact path remains available.
+                    }
+                }
+#else
+                indirect_owner=std::make_unique<CachedEventStorage>(o.threads,Buckets<CachedRawLocation>(o.ingest_shards));
+                indirect=indirect_owner.get();
+#endif
+            }
         }
 #endif
         auto process_raw=[&](auto& raw) {
-            parse_events<R>(raw,indirect.get());
+            parse_events<R>(raw,indirect);
             timer.mark(o.overlap_links?"parse_events_and_links":"parse_events");
             if constexpr(is_location_record<R>)mark_duplicate_locations<R>(raw);
             else dedup<R>(raw);
