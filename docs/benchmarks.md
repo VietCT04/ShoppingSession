@@ -512,3 +512,10 @@ build repeated the gain from **1.236 to 1.139 seconds**. Deduplication
 took **0.067 seconds** in the profiled candidate run and **0.209 seconds**
 in its control. All outputs matched. Use `--uncached-indirect-events` to
 time the original deduplication path on mixed-length inputs.
+
+The profile-guided build of `4be76bd` measured a **1.090-second** median
+over five pinned runs on the refreshed 20M set. The standard build of the
+same source measured **1.121 seconds** in the alternating batch. The fastest
+profile-guided run took **1.056 seconds**. Every output matched the full
+reference. The binary also passed all 36 fixtures, the refreshed official
+dev comparison, and a separate default-settings 20M run.
