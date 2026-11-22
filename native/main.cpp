@@ -159,7 +159,6 @@ struct Options {
     bool narrow_duplicate_locations=true;
     bool branchless_event_validation=true;
     bool reserve_routes=true;
-    bool parallel_route_reserve=true;
     bool cache_utc_days=true;
     bool split_group_purchases=true;
     bool persistent_workers=true;
@@ -239,8 +238,6 @@ Options options(int argc,char** argv) {
         else if(arg=="--conditional-event-validation")o.branchless_event_validation=false;
         else if(arg=="--reserve-routes")o.reserve_routes=true;
         else if(arg=="--grow-routes")o.reserve_routes=false;
-        else if(arg=="--parallel-route-reserve")o.parallel_route_reserve=true;
-        else if(arg=="--serial-route-reserve")o.parallel_route_reserve=false;
         else if(arg=="--cache-utc-days")o.cache_utc_days=true;
         else if(arg=="--no-cache-utc-days")o.cache_utc_days=false;
         else if(arg=="--split-group-purchases")o.split_group_purchases=true;
@@ -329,15 +326,11 @@ struct Pipeline {
         for(auto chunk:chunks)bytes+=chunk.end-chunk.begin;
         size_t expected=bytes/(bytes_per_row*o.threads*o.shards);
         if(expected<32)return;
-        auto reserve_worker=[&](size_t worker,int) {
-            try {
-                for(auto& shard:routes[worker])shard.reserve(expected);
-            } catch(const std::bad_alloc&) {
-                // Partially reserved vectors can still grow on demand.
-            }
-        };
-        if(o.parallel_route_reserve&&o.persistent_workers)parallel(routes.size(),o.threads,reserve_worker);
-        else for(size_t worker=0;worker<routes.size();++worker)reserve_worker(worker,0);
+        try {
+            for(auto& worker:routes)for(auto& shard:worker)shard.reserve(expected);
+        } catch(const std::bad_alloc&) {
+            // Partial reservations are valid and vectors can still grow on demand.
+        }
     }
     void load() {
         std::ifstream mf(o.data/"manifest.json");
