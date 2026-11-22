@@ -78,7 +78,7 @@ struct StrictTimeParser {
         uint16_t day;
         std::memcpy(&prefix,p,8);
         std::memcpy(&day,p+8,2);
-        if(prefix!=cached.prefix||day!=cached.day||p[10]!='T'||p[19]!='Z')return BAD;
+        if(!cached.prefix||prefix!=cached.prefix||day!=cached.day||p[10]!='T'||p[19]!='Z')return BAD;
         if constexpr(std::endian::native!=std::endian::little)return BAD;
         uint64_t time;
         std::memcpy(&time,p+11,8);

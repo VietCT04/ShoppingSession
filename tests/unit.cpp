@@ -119,6 +119,8 @@ int main(){try{
             require(parser.parse(epoch)==timestamp(epoch),"SWAR epoch parser equals general parser");
         }
         const std::string leap_day="2028-02-29T23:59:59Z";
+        const auto empty_date=std::string(10,'\0')+"T12:34:56Z";
+        require(parser.parse(empty_date,true)==-1,"unused UTC cache slots reject an invalid date");
         for(size_t position=0;position<leap_day.size();++position) {
             for(unsigned byte=0;byte<256;++byte) {
                 auto input=leap_day;
