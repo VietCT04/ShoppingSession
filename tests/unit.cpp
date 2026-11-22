@@ -4,6 +4,7 @@
 #include "../native/id.hpp"
 #include "../native/short_id.hpp"
 #include "../native/event_id.hpp"
+#include "../native/worker_pool.hpp"
 #include "../native/csv_scan.hpp"
 #include "../native/ingest_order.hpp"
 #include "../native/sparse_state.hpp"
@@ -54,6 +55,19 @@ int main(){try{
     require(!digits("10000001",n,10000000)&&!digits("٢٥٠",n),"price bounds and ASCII");
     People p;p.join("z","y");p.join("y","x");p.join("A","z");p.join("z","z");p.join("é","A");p.finish();
     require(p.person("x")=="A"&&p.person("é")=="A"&&p.person("independent")=="independent","union find minimum");
+    {
+        WorkerPool pool(3);
+        bool propagated=false;
+        try {pool.run(8,[](size_t i,int){if(i==3)throw std::runtime_error("worker test");});}
+        catch(const std::runtime_error&){propagated=true;}
+        require(propagated,"pool propagates worker failures");
+        for(int round=0;round<3;++round) {
+            std::vector<int> assigned(17,-1);
+            pool.run(assigned.size(),[&](size_t i,int worker){assigned[i]=worker;});
+            require(std::all_of(assigned.begin(),assigned.end(),[](int worker){return worker>=0&&worker<3;}),
+                "pool assigns every job in each stage");
+        }
+    }
     FlatMap<uint32_t> map;
     std::vector<std::string> keys;keys.reserve(10000);
     for(size_t i=0;i<10000;++i)keys.push_back("exact key "+std::to_string(i));

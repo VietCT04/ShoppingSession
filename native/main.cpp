@@ -11,6 +11,7 @@
 #include "location_codec.hpp"
 #include "sparse_state.hpp"
 #include "fast_time.hpp"
+#include "worker_pool.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
 #ifdef SHOP_IPS_SORTS
 #include "ips4o.hpp"
@@ -159,6 +160,7 @@ struct Options {
     bool reserve_routes=true;
     bool cache_utc_days=true;
     bool split_group_purchases=true;
+    bool persistent_workers=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -235,6 +237,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--no-cache-utc-days")o.cache_utc_days=false;
         else if(arg=="--split-group-purchases")o.split_group_purchases=true;
         else if(arg=="--inline-group-purchases")o.split_group_purchases=false;
+        else if(arg=="--persistent-workers")o.persistent_workers=true;
+        else if(arg=="--transient-workers")o.persistent_workers=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -289,10 +293,18 @@ struct Pipeline {
     std::vector<std::vector<Aggregate>> dense_totals;
     std::vector<WorkProfile> profiles;
     std::unique_ptr<LocationCodec> location_codec;
+    std::unique_ptr<WorkerPool> workers;
     explicit Pipeline(Options options):o(std::move(options)),
         events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
     using Clock=std::chrono::steady_clock;
     static double elapsed(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
+    template<class F>void parallel(size_t jobs,int threads,F work) {
+        if(!o.persistent_workers||threads==1)shop::parallel(jobs,threads,std::move(work));
+        else {
+            if(!workers)workers=std::make_unique<WorkerPool>(threads);
+            workers->run(jobs,std::move(work));
+        }
+    }
     size_t shard(Key s)const{return KeyHash{}(s)&(o.shards-1);}
     size_t event_shard(EventId s)const{return EventIdHash{}(s)&(o.dedup_shards-1);}
     template<class T>

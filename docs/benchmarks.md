@@ -449,3 +449,9 @@ in the same alternating batch. The fastest complete run took **0.930 seconds**.
 Both tables matched the full reference every time. The same profile-guided
 binary passed all 36 fixtures, the official dev comparison, and a separate
 default-settings 20M run.
+
+One worker pool now handles the successive parsing, deduplication, and
+session tasks. It joins each stage at a barrier and passes worker failures
+back to the caller. The five-pair 20M medians improved from **1.427 to 1.415
+seconds** and from **1.423 to 1.405 seconds**, with exact outputs in both
+batches. Use `--transient-workers` to compare per-stage thread creation.
