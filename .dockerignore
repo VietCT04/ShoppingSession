@@ -3,7 +3,10 @@
 build
 data
 out
+out-*
 scratch
-tools
+tools/*
+!tools/generator
+tools/generator/target
 fixtures
 benchmarks

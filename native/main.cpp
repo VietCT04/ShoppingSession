@@ -133,7 +133,10 @@ struct TimeSortKey {
     template<class E>uint64_t operator()(const E& e)const{return uint64_t(e.ts)^0x8000000000000000ULL;}
 };
 struct Aggregate {int64_t sessions=0,purchasing=0,revenue=0,assisted=0;};
-struct WorkProfile {double gather=0,intern=0,sort=0,aggregate=0,parquet=0;};
+struct WorkProfile {
+    double gather=0,intern=0,sort=0,merge=0,local_sort=0,aggregate=0,parquet=0;
+    uint64_t sessions=0,no_click_sessions=0;
+};
 using CampaignTotals=std::map<std::pair<int64_t,uint32_t>,Aggregate>;
 template<class T> using Buckets=std::vector<std::vector<T>>;
 template<class T> using Workers=std::vector<Buckets<T>>;
@@ -188,6 +191,7 @@ struct Options {
     bool persistent_workers=true;
     bool compact_assist_counters=true;
     bool fuse_isolated_groups=true;
+    bool worker_parquet=false;
     size_t gap_bin_min_events=256;
     size_t sparse_bin_min_events=16;
     std::string dedup="flat";
@@ -278,6 +282,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--wide-assist-counters")o.compact_assist_counters=false;
         else if(arg=="--fuse-isolated-groups")o.fuse_isolated_groups=true;
         else if(arg=="--defer-isolated-groups")o.fuse_isolated_groups=false;
+        else if(arg=="--worker-parquet")o.worker_parquet=true;
         else if(arg=="--gap-bin-min-events"&&i+1<argc)o.gap_bin_min_events=std::stoull(argv[++i]);
         else if(arg=="--sparse-bin-min-events"&&i+1<argc)o.sparse_bin_min_events=std::stoull(argv[++i]);
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
@@ -316,6 +321,10 @@ Options options(int argc,char** argv) {
     return o;
 }
 struct Pipeline {
+    struct UserOutput {
+        std::vector<parquet::Column> columns;
+        std::unique_ptr<parquet::File> file;
+    };
     Options o;
     Inputs in;
     PeopleType people;
@@ -334,9 +343,11 @@ struct Pipeline {
     std::vector<std::vector<Aggregate>> dense_totals;
     std::vector<std::vector<uint32_t>> dense_assists;
     std::vector<WorkProfile> profiles;
+    std::vector<UserOutput> user_outputs;
     std::unique_ptr<LocationCodec> location_codec;
     std::unique_ptr<WorkerPool> workers;
     bool cache_user_hashes=false;
+    const bool profile_detail=std::getenv("SHOP_PROFILE_DETAIL")!=nullptr;
     explicit Pipeline(Options options):o(std::move(options)),
         events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
     using Clock=std::chrono::steady_clock;
@@ -413,6 +424,14 @@ struct Pipeline {
         if(!o.overlap_links)build_links();
         for(auto p:files(o.data/"events"))in.add(p,in.events);
         for(auto p:files(o.data/"clicks"))in.add(p,in.clicks);
+        if(o.worker_parquet) {
+            size_t bytes=0;
+            for(auto chunk:in.events)bytes+=chunk.end-chunk.begin;
+            // Each accepted event row contains at least six separators.
+            const int count_type=o.narrow_count_columns&&bytes/6<=INT32_MAX?1:2;
+            user_outputs.resize(o.threads);
+            for(auto& output:user_outputs)output.columns=user_columns(count_type);
+        }
         if(o.compact_assist_counters&&o.redirect_linked_groups&&o.specialize_aggregation&&
            o.array_active&&o.array_categories&&o.dense_totals) {
             size_t bytes=0;
@@ -899,8 +918,18 @@ struct Pipeline {
     }
     void report_session_profile()const {
         WorkProfile sum;
-        for(auto p:profiles){sum.gather+=p.gather;sum.intern+=p.intern;sum.sort+=p.sort;sum.aggregate+=p.aggregate;sum.parquet+=p.parquet;}
+        for(const auto& p:profiles) {
+            sum.gather+=p.gather;sum.intern+=p.intern;sum.sort+=p.sort;sum.merge+=p.merge;
+            sum.local_sort+=p.local_sort;sum.aggregate+=p.aggregate;sum.parquet+=p.parquet;
+            sum.sessions+=p.sessions;sum.no_click_sessions+=p.no_click_sessions;
+        }
         std::cerr<<"session_work_seconds gather="<<sum.gather<<" intern="<<sum.intern<<" sort="<<sum.sort<<" aggregate="<<sum.aggregate<<" parquet="<<sum.parquet<<'\n';
+        if(profile_detail) {
+            std::cerr<<"session_detail_worker_seconds grouping="<<sum.gather+sum.intern+sum.merge
+                <<" sorting_and_binning="<<sum.sort+sum.local_sort<<" aggregation="<<sum.aggregate-sum.local_sort-sum.merge
+                <<" user_parquet="<<sum.parquet<<'\n';
+            std::cerr<<"session_click_counts sessions="<<sum.sessions<<" without_clicks="<<sum.no_click_sessions<<'\n';
+        }
     }
     template<class E,class ConsumeEvents,class ConsumeClicks>
     void encode_partition(size_t s,int worker,size_t event_count,size_t click_count,
@@ -975,10 +1004,15 @@ struct Pipeline {
             [[no_unique_address]] std::conditional_t<SplitPurchases,std::span<LinkedEvent>,NoPurchases> purchases;
         };
         const bool specialized=o.specialize_aggregation&&o.array_active&&o.array_categories&&o.dense_totals;
-        auto consume_group=[&](const Group& group,auto& consume) {
+        auto consume_group=[&](const Group& group,auto& consume,int worker) {
             auto ev=group.events;
             auto cl=group.clicks;
             if(ev.empty())return;
+            const auto before=profile_detail?Clock::now():Clock::time_point{};
+            auto sorted=[&](auto records,auto... args) {
+                if(profile_detail)profiles[worker].local_sort+=elapsed(before);
+                consume(group.name,records,cl,start,start-WEEK,args...);
+            };
             if(cl.size()>1)sort_group(cl.data(),cl.data()+cl.size(),[](auto& a,auto& b){return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;});
             if constexpr(SplitPurchases) {
                 auto purchases=group.purchases;
@@ -986,19 +1020,19 @@ struct Pipeline {
                     [](auto& a,auto& b){return a.ts<b.ts;});
                 if(o.gap_bin_min_events&&o.sparse_bin_min_events&&ev.size()>=o.sparse_bin_min_events&&ev.size()<1024) {
                     thread_local GapSessions<true> sparse_bins;
-                    consume(group.name,sparse_bins.summarize(ev,uint32_t(end-start-1)),cl,start,start-WEEK,purchases);
+                    sorted(sparse_bins.summarize(ev,uint32_t(end-start-1)),purchases);
                     return;
                 }
                 if(o.gap_bin_min_events&&ev.size()>=o.gap_bin_min_events) {
                     thread_local GapSessions<> bins;
-                    consume(group.name,bins.summarize(ev,uint32_t(end-start-1)),cl,start,start-WEEK,purchases);
+                    sorted(bins.summarize(ev,uint32_t(end-start-1)),purchases);
                     return;
                 }
                 sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
-                consume(group.name,ev,cl,start,start-WEEK,purchases);
+                sorted(ev,purchases);
             } else {
                 sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
-                consume(group.name,ev,cl,start,start-WEEK);
+                sorted(ev);
             }
         };
         std::vector<Source> sources(o.shards);
@@ -1073,7 +1107,7 @@ struct Pipeline {
             }
             profiles[worker].intern+=elapsed(before);
             if(!isolated.empty()) {
-                auto enumerate=[&](auto consume){for(const auto& group:isolated)consume_group(group,consume);};
+                auto enumerate=[&](auto consume){for(const auto& group:isolated)consume_group(group,consume,worker);};
                 if(specialized)aggregate_users<true>(s,worker,isolated_events,enumerate,"part-independent-");
                 else aggregate_users(s,worker,isolated_events,enumerate,"part-independent-");
             }
@@ -1090,6 +1124,7 @@ struct Pipeline {
                 std::vector<LinkedClick> merged_clicks;
                 std::vector<LinkedEvent> merged_purchases;
                 for(size_t i=0;i<groups.size();) {
+                    const auto group_start=profile_detail?Clock::now():Clock::time_point{};
                     size_t finish=i+1;
                     while(finish<groups.size()&&groups[finish].name==groups[i].name)++finish;
                     Group group=groups[i];
@@ -1105,7 +1140,8 @@ struct Pipeline {
                         group.events=std::span(merged_events);group.clicks=std::span(merged_clicks);
                         if constexpr(SplitPurchases)group.purchases=std::span(merged_purchases);
                     }
-                    consume_group(group,consume);
+                    if(profile_detail)profiles[worker].merge+=elapsed(group_start);
+                    consume_group(group,consume,worker);
                     i=finish;
                 }
             };
@@ -1170,12 +1206,34 @@ struct Pipeline {
                 }
             });
     }
+    static std::vector<parquet::Column> user_columns(int count_type) {
+        return {{"user_id",6},{"day",1,false,true},{"sessions",count_type},{"events",count_type},
+                {"revenue_cents",2},{"top_category",6,true}};
+    }
+    void flush_user_output(size_t index,int worker,bool finish=false) {
+        auto before=Clock::now();
+        auto& [columns,file]=user_outputs[index];
+        if(columns[0].count||(!file&&index==0&&finish)) {
+            if(!file)file=std::make_unique<parquet::File>(
+                (o.out/"user_daily"/("part-"+std::to_string(index)+".parquet")).string());
+            file->append(columns);
+            for(auto& column:columns) {
+                column.values.clear();
+                column.levels.clear();
+                column.count=0;
+            }
+        }
+        if(finish&&file)file->finish(columns);
+        profiles[worker].parquet+=elapsed(before);
+    }
     template<bool Arrays=false,class Enumerate>void aggregate_users(size_t s,int worker,size_t event_count,Enumerate enumerate,
                                                                     const char* output_prefix="part-") {
             auto before=Clock::now();
-            using parquet::Column;
+            const double previous_parquet=profiles[worker].parquet;
             const int count_type=o.narrow_count_columns&&event_count<=INT32_MAX?1:2;
-            std::vector<Column> cols={{"user_id",6},{"day",1,false,true},{"sessions",count_type},{"events",count_type},{"revenue_cents",2},{"top_category",6,true}};
+            const bool batch=o.worker_parquet;
+            auto shard_columns=batch?std::vector<parquet::Column>{}:user_columns(count_type);
+            auto& cols=batch?user_outputs[worker].columns:shard_columns;
             CampaignWindow campaign_window((Arrays||o.array_active)?campaign_names.size():0);
             CategoryRevenue category_revenue((Arrays||o.array_categories)?categories.size():0);
             enumerate([&](Key person_name,auto ev,auto cl,int64_t time_base,int64_t click_base,
@@ -1198,6 +1256,10 @@ struct Pipeline {
                 };
                 auto flush=[&]{
                     if(!ns)return;
+                    if(profile_detail) {
+                        profiles[worker].sessions+=ns;
+                        if(cl.empty())profiles[worker].no_click_sessions+=ns;
+                    }
                     cols[0].text(person);cols[1].number(day);cols[2].number(ns);cols[3].number(ne);cols[4].number(nr);
                     if(Arrays||o.array_categories) {
                         if(category_revenue.present.empty())cols[5].null();
@@ -1209,6 +1271,9 @@ struct Pipeline {
                     ns=ne=nr=0;
                     if constexpr(!Arrays)cat_revenue.clear();
                     category_revenue.clear();
+                    constexpr size_t column_target=8u<<20;
+                    if(batch&&(cols[0].values.size()>=column_target||cols[5].values.size()>=column_target))
+                        flush_user_output(worker,worker);
                 };
                 for(size_t i=0;i<ev.size();) {
                     const int64_t st=time_base+ev[i].ts,sd=dayof(st);
@@ -1279,9 +1344,12 @@ struct Pipeline {
                 }
                 flush();
             });
-            profiles[worker].aggregate+=elapsed(before);before=Clock::now();
-            if(cols[0].count||s==0)parquet::write((o.out/"user_daily"/(output_prefix+std::to_string(s)+".parquet")).string(),cols);
-            profiles[worker].parquet+=elapsed(before);
+            profiles[worker].aggregate+=elapsed(before)-(profiles[worker].parquet-previous_parquet);
+            if(!batch) {
+                before=Clock::now();
+                if(cols[0].count||s==0)parquet::write((o.out/"user_daily"/(output_prefix+std::to_string(s)+".parquet")).string(),cols);
+                profiles[worker].parquet+=elapsed(before);
+            }
     }
     void campaigns_output() {
         CampaignTotals all;
@@ -1381,6 +1449,9 @@ struct Pipeline {
             else sessionize_linked_groups();
         }
         else sessionize();
+        if(o.worker_parquet)parallel(user_outputs.size(),o.threads,[&](size_t index,int worker){
+            flush_user_output(index,worker,true);
+        });
         report_session_profile();
         t.mark("sessions_and_user_output");
         campaigns_output();t.mark("campaign_output");

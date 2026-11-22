@@ -533,3 +533,24 @@ five-pair median from **1.130 to 1.079 seconds**. The production build
 improved from **1.496 to 1.452 seconds** against the preceding source,
 with a same-binary comparison of **1.505 vs 1.469 seconds**. All outputs
 matched. Use `--plain-user-routes` to disable the cached hashes and prefetch.
+
+### Submission build and worker-local output
+
+On the refreshed seed-7 20M set, five alternating runs per build measured
+**1.240 s plain vs 1.168 s with PGO** on the same source. The GCC 14 PGO
+stage took 104 seconds locally, using a separate seed-42 training set. The
+runs used the Dockerfile's GCC and Debian base images in local Linux
+namespaces with eight pinned CPUs, a 24 GiB cgroup limit, and swap disabled.
+These results exclude Docker daemon and scorer overhead.
+
+A second five-pair batch used the same PGO binary for both output layouts.
+`--worker-parquet` reduced `user_daily` from 512 files to 8 and measured
+**1.146 s vs 1.162 s** for shard files. It won two of five pairs, so shard
+files remain the default. All 20 timed runs matched both reference tables.
+
+One detailed run spent 0.486 s of wall time on event parsing and links,
+0.086 s on deduplication, and 0.116 s on click parsing. Summed worker time
+was 2.952 s for grouping and canonicalization, 1.161 s for sorting and
+temporal binning, 1.382 s for aggregation, and 0.241 s for user Parquet.
+Campaign reduction and output took 0.017 s of wall time. Users with zero
+valid clicks accounted for 1,201,194 of 3,417,672 sessions (35.1%).

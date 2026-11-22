@@ -51,50 +51,71 @@ struct Column {
     void text(std::string_view s) { present(true); little<uint32_t>(values,s.size()); values.append(s); }
     void null() { if(!nullable) throw std::runtime_error("null in required column"); present(false); }
 };
-inline void write(const std::string& path, const std::vector<Column>& columns) {
-    if(columns.empty()) throw std::runtime_error("empty schema");
-    std::ofstream out(path,std::ios::binary);
-    out.exceptions(std::ios::badbit | std::ios::failbit);
-    out.write("PAR1",4);
-    Compact chunks;
-    uint64_t total=0, rows=columns[0].count;
-    for(const auto& c:columns) {
-        if(c.count!=rows) throw std::runtime_error("unequal column lengths");
-        Bytes page;
-        if(c.nullable) {
-            Bytes rle;
-            for(size_t i=0;i<c.levels.size();) {
-                size_t j=i+1;
-                while(j<c.levels.size() && c.levels[j]==c.levels[i]) ++j;
-                varint(rle,(j-i)*2); rle+=c.levels[i]; i=j;
+class File {
+    std::ofstream out;
+    std::vector<Compact> groups;
+    uint64_t rows=0;
+
+public:
+    explicit File(const std::string& path):out(path,std::ios::binary) {
+        out.exceptions(std::ios::badbit | std::ios::failbit);
+        out.write("PAR1",4);
+    }
+
+    void append(const std::vector<Column>& columns) {
+        if(columns.empty()) throw std::runtime_error("empty schema");
+        Compact chunks;
+        uint64_t total=0, group_rows=columns[0].count;
+        for(const auto& c:columns) {
+            if(c.count!=group_rows) throw std::runtime_error("unequal column lengths");
+            Bytes page;
+            if(c.nullable) {
+                Bytes rle;
+                for(size_t i=0;i<c.levels.size();) {
+                    size_t j=i+1;
+                    while(j<c.levels.size() && c.levels[j]==c.levels[i]) ++j;
+                    varint(rle,(j-i)*2); rle+=c.levels[i]; i=j;
+                }
+                little<uint32_t>(page,rle.size()); page+=rle;
             }
-            little<uint32_t>(page,rle.size()); page+=rle;
+            page+=c.values;
+            if(page.size()>INT32_MAX || group_rows>INT32_MAX) throw std::runtime_error("Parquet page too large; use more output partitions");
+            Compact data; data.num(1,group_rows); data.num(2,0); data.num(3,3); data.num(4,3);
+            Compact header; header.num(1,0); header.num(2,page.size()); header.num(3,page.size()); header.structure(5,data);
+            header.b+=char(0);
+            uint64_t offset=uint64_t(out.tellp()), size=header.b.size()+page.size();
+            out.write(header.b.data(),header.b.size()); out.write(page.data(),page.size());
+            Compact meta; meta.num(1,c.type); meta.list(2,5,2); integer(meta.b,0); integer(meta.b,3);
+            meta.list(3,8,1); binary(meta.b,c.name); meta.num(4,0); meta.num(5,group_rows,6);
+            meta.num(6,size,6); meta.num(7,size,6); meta.num(9,offset,6);
+            Compact chunk; chunk.num(2,offset,6); chunk.structure(3,meta); chunks.item(chunk); total+=size;
         }
-        page+=c.values;
-        if(page.size()>INT32_MAX || rows>INT32_MAX) throw std::runtime_error("Parquet page too large; use more output partitions");
-        Compact data; data.num(1,rows); data.num(2,0); data.num(3,3); data.num(4,3);
-        Compact header; header.num(1,0); header.num(2,page.size()); header.num(3,page.size()); header.structure(5,data);
-        header.b+=char(0);
-        uint64_t offset=uint64_t(out.tellp()), size=header.b.size()+page.size();
-        out.write(header.b.data(),header.b.size()); out.write(page.data(),page.size());
-        Compact meta; meta.num(1,c.type); meta.list(2,5,2); integer(meta.b,0); integer(meta.b,3);
-        meta.list(3,8,1); binary(meta.b,c.name); meta.num(4,0); meta.num(5,rows,6);
-        meta.num(6,size,6); meta.num(7,size,6); meta.num(9,offset,6);
-        Compact chunk; chunk.num(2,offset,6); chunk.structure(3,meta); chunks.item(chunk); total+=size;
+        Compact group; group.list(1,12,columns.size()); group.b+=chunks.b;
+        group.num(2,total,6); group.num(3,group_rows,6);
+        groups.push_back(std::move(group));
+        rows+=group_rows;
     }
-    Compact root; root.str(4,"schema"); root.num(5,columns.size());
-    Compact footer; footer.num(1,1); footer.list(2,12,columns.size()+1); footer.item(root);
-    for(const auto& c:columns) {
-        Compact schema; schema.num(1,c.type); schema.num(3,c.nullable?1:0); schema.str(4,c.name);
-        if(c.type==6) schema.num(6,0); else if(c.date) schema.num(6,6);
-        footer.item(schema);
+
+    void finish(const std::vector<Column>& columns) {
+        Compact root; root.str(4,"schema"); root.num(5,columns.size());
+        Compact footer; footer.num(1,1); footer.list(2,12,columns.size()+1); footer.item(root);
+        for(const auto& c:columns) {
+            Compact schema; schema.num(1,c.type); schema.num(3,c.nullable?1:0); schema.str(4,c.name);
+            if(c.type==6) schema.num(6,0); else if(c.date) schema.num(6,6);
+            footer.item(schema);
+        }
+        footer.num(3,rows,6); footer.list(4,12,groups.size());
+        for(const auto& group:groups)footer.item(group);
+        footer.str(6,"shopping-sessions-cpp"); footer.b+=char(0);
+        out.write(footer.b.data(),footer.b.size());
+        Bytes length; little<uint32_t>(length,footer.b.size()); out.write(length.data(),4); out.write("PAR1",4);
+        out.close();
     }
-    footer.num(3,rows,6); footer.list(4,12,1);
-    Compact group; group.list(1,12,columns.size()); group.b+=chunks.b;
-    group.num(2,total,6); group.num(3,rows,6); footer.item(group);
-    footer.str(6,"shopping-sessions-cpp"); footer.b+=char(0);
-    out.write(footer.b.data(),footer.b.size());
-    Bytes length; little<uint32_t>(length,footer.b.size()); out.write(length.data(),4); out.write("PAR1",4);
-    out.close();
+};
+
+inline void write(const std::string& path, const std::vector<Column>& columns) {
+    File file(path);
+    file.append(columns);
+    file.finish(columns);
 }
 }

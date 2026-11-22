@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run the image the way the scorer does: docker_run.sh DATA_DIR OUTPUT_DIR
+# Run the image the way the scorer does: docker_run.sh DATA_DIR OUTPUT_DIR [FLAGS]
 # Same flags as the scorer box, except the resource limits come from CPUS / MEM.
 set -eu
 IMAGE="${IMAGE:-shopping-sessions:latest}"
@@ -8,6 +8,7 @@ MEM="${MEM:-24g}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 DATA=$(cd "$1" && pwd)
 mkdir -p "$2"; OUT=$(cd "$2" && pwd)
+shift 2
 SCRATCH=$(mktemp -d)
 chmod 777 "$OUT" "$SCRATCH"
 # The run's files belong to uid 1000, as on the scorer. If that is not you (a
@@ -25,9 +26,10 @@ trap release EXIT
 docker run --rm --platform "$PLATFORM" \
   --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
   --cap-drop ALL --security-opt no-new-privileges \
-  --pids-limit 4096 --cpus "$CPUS" --memory "$MEM" --memory-swap "$MEM" \
+  --pids-limit 4096 --cpus "$CPUS" ${CPUSET:+--cpuset-cpus="$CPUSET"} --memory "$MEM" --memory-swap "$MEM" \
   --user 1000:1000 \
   -v "$DATA":/data:ro,z -v "$OUT":/output:z -v "$SCRATCH":/scratch:z \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
   -e NCPU="${NCPU:-${CPUS%.*}}" -e MEM_GB="${MEM%g}" \
-  "$IMAGE"
+  -e SHOP_PROFILE_CPU -e SHOP_PROFILE_DETAIL \
+  "$IMAGE" "$@"
