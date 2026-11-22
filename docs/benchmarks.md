@@ -469,3 +469,11 @@ for canonical-person processing. The five-pair 20M median improved from
 **1.337 to 1.321 seconds** with compact assist counters and **1.352 to 1.325
 seconds** in an earlier batch. All outputs matched the reference. Use
 `--defer-isolated-groups` to compare the single aggregation pass.
+
+Groups with at least 256 events can recover their session boundaries from
+30-minute bins. Each bin retains its first timestamp, last timestamp, and
+event count. Adjacent occupied bins merge if the gap between them is at most
+30 minutes. Purchases and clicks retain their time ordering for attribution.
+The five-pair 20M medians improved from **1.356 to 1.329 seconds** and
+**1.373 to 1.316 seconds**, with exact outputs in both batches. Use
+`--gap-bin-min-events 0` to time the full timestamp sort.

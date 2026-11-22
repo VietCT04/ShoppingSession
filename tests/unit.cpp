@@ -11,6 +11,7 @@
 #include "../native/fast_time.hpp"
 #include "../native/ingest_arena.hpp"
 #include "../native/location_codec.hpp"
+#include "../native/gap_sessions.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <random>
@@ -132,6 +133,33 @@ int main(){try{
             char eight[9];unsigned n=rng()%100000000;
             std::snprintf(eight,sizeof(eight),"%08u",n);
             require(StrictTimeParser::eight_digits(eight)&&StrictTimeParser::decimal8(eight)==n,"eight-digit conversion");
+        }
+    }
+    {
+        struct Event {uint32_t ts;};
+        GapSessions bins;
+        const uint32_t gap=uint32_t(GAP),limit=100*gap;
+        auto compare_sessions=[&](std::vector<Event> events) {
+            auto summarized=bins.summarize(std::span(events),limit);
+            std::sort(events.begin(),events.end(),[](const auto& a,const auto& b){return a.ts<b.ts;});
+            size_t session=0;
+            for(size_t first=0;first<events.size();) {
+                size_t last=first+1;
+                while(last<events.size()&&events[last].ts-events[last-1].ts<=gap)++last;
+                require(session<summarized.size(),"every sorted session has a gap summary");
+                const auto& actual=summarized[session++];
+                require(actual.ts==events[first].ts&&actual.last==events[last-1].ts&&actual.count==last-first,
+                        "gap summaries preserve exact boundaries and event counts");
+                first=last;
+            }
+            require(session==summarized.size(),"gap bins produce no extra sessions");
+        };
+        compare_sessions({{3*gap+1},{gap},{limit},{2*gap},{0},{2*gap}});
+        compare_sessions({});
+        for(size_t repeat=0;repeat<100;++repeat) {
+            std::vector<Event> events;
+            for(size_t i=0,n=rng()%500;i<n;++i)events.push_back({uint32_t(rng()%limit)});
+            compare_sessions(std::move(events));
         }
     }
     {

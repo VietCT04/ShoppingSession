@@ -12,6 +12,7 @@
 #include "sparse_state.hpp"
 #include "fast_time.hpp"
 #include "worker_pool.hpp"
+#include "gap_sessions.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
 #ifdef SHOP_IPS_SORTS
 #include "ips4o.hpp"
@@ -163,6 +164,7 @@ struct Options {
     bool persistent_workers=true;
     bool compact_assist_counters=true;
     bool fuse_isolated_groups=true;
+    size_t gap_bin_min_events=256;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -245,6 +247,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--wide-assist-counters")o.compact_assist_counters=false;
         else if(arg=="--fuse-isolated-groups")o.fuse_isolated_groups=true;
         else if(arg=="--defer-isolated-groups")o.fuse_isolated_groups=false;
+        else if(arg=="--gap-bin-min-events"&&i+1<argc)o.gap_bin_min_events=std::stoull(argv[++i]);
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -900,14 +903,22 @@ struct Pipeline {
             auto ev=group.events;
             auto cl=group.clicks;
             if(ev.empty())return;
-            sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
             if(cl.size()>1)sort_group(cl.data(),cl.data()+cl.size(),[](auto& a,auto& b){return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;});
             if constexpr(SplitPurchases) {
                 auto purchases=group.purchases;
                 if(purchases.size()>1)sort_group(purchases.data(),purchases.data()+purchases.size(),
                     [](auto& a,auto& b){return a.ts<b.ts;});
+                if(o.gap_bin_min_events&&ev.size()>=o.gap_bin_min_events) {
+                    thread_local GapSessions bins;
+                    consume(group.name,bins.summarize(ev,uint32_t(end-start-1)),cl,start,start-WEEK,purchases);
+                    return;
+                }
+                sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
                 consume(group.name,ev,cl,start,start-WEEK,purchases);
-            } else consume(group.name,ev,cl,start,start-WEEK);
+            } else {
+                sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
+                consume(group.name,ev,cl,start,start-WEEK);
+            }
         };
         std::vector<Source> sources(o.shards);
         Workers<Group> grouped(o.threads,Buckets<Group>(o.shards));
@@ -1085,6 +1096,8 @@ struct Pipeline {
             CategoryRevenue category_revenue((Arrays||o.array_categories)?categories.size():0);
             enumerate([&](Key person_name,auto ev,auto cl,int64_t time_base,int64_t click_base,
                           std::span<LinkedEvent> purchases={}) {
+                using EventType=std::remove_cv_t<typename decltype(ev)::element_type>;
+                constexpr bool summarized=std::is_same_v<EventType,GapSession>;
                 ShortId::Buffer decoded_name;
                 SV person=text(person_name,decoded_name);
                 size_t hi=0,lo=0,purchase_index=0;
@@ -1123,7 +1136,12 @@ struct Pipeline {
                             if(!dense_assists.empty())day_assists=dense_assists[worker].data()+offset;
                         }
                     }
-                    size_t j=i+1;while(j<ev.size()&&ev[j].ts-ev[j-1].ts<=GAP)++j;
+                    size_t j=i+1,session_events;
+                    if constexpr(summarized)session_events=ev[i].count;
+                    else {
+                        while(j<ev.size()&&ev[j].ts-ev[j-1].ts<=GAP)++j;
+                        session_events=j-i;
+                    }
                     int64_t revenue=0;
                     auto add_purchase=[&](uint32_t price,uint32_t category) {
                         if(!price)return;
@@ -1131,16 +1149,19 @@ struct Pipeline {
                         if(Arrays||o.array_categories)category_revenue.add(category,price);
                         else if constexpr(!Arrays)cat_revenue[category]+=price;
                     };
-                    if constexpr(std::is_same_v<typename decltype(ev)::element_type,LinkedTimestamp>) {
+                    if constexpr(summarized||std::is_same_v<EventType,LinkedTimestamp>) {
                         // Every purchase still has a timestamp in ev. The
                         // session's last event bounds its purchase stream.
-                        while(purchase_index<purchases.size()&&purchases[purchase_index].ts<=ev[j-1].ts) {
+                        uint32_t last;
+                        if constexpr(summarized)last=ev[i].last;
+                        else last=ev[j-1].ts;
+                        while(purchase_index<purchases.size()&&purchases[purchase_index].ts<=last) {
                             uint32_t packed=purchases[purchase_index++].purchase;
                             add_purchase(packed&CompactRaw::price_mask,packed>>24);
                         }
                     } else for(size_t k=i;k<j;++k) {
                         uint32_t price,category;
-                        if constexpr(std::is_same_v<typename decltype(ev)::element_type,LinkedEvent>) {
+                        if constexpr(std::is_same_v<EventType,LinkedEvent>) {
                             price=ev[k].purchase&CompactRaw::price_mask;
                             category=ev[k].purchase>>24;
                         } else {
@@ -1149,7 +1170,7 @@ struct Pipeline {
                         }
                         add_purchase(price,category);
                     }
-                    ++ns;ne+=j-i;nr+=revenue;
+                    ++ns;ne+=session_events;nr+=revenue;
                     uint32_t credited=0;
                     const int64_t click_at=st-click_base;
                     if(!Arrays&&o.baseline) {
