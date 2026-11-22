@@ -477,3 +477,10 @@ event count. Adjacent occupied bins merge if the gap between them is at most
 The five-pair 20M medians improved from **1.356 to 1.329 seconds** and
 **1.373 to 1.316 seconds**, with exact outputs in both batches. Use
 `--gap-bin-min-events 0` to time the full timestamp sort.
+
+The profile-guided build of `eef75ea` measured a **0.904-second** median
+over five pinned 20M runs. The previous record binary measured **0.947
+seconds** in the same alternating batch. The fastest new run took **0.898
+seconds**, and all ten outputs matched the full reference. The new binary
+also passed the 36 default fixtures, the official dev comparison, and an
+independent default-settings 20M run.
