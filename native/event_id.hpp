@@ -19,6 +19,7 @@ public:
         value.word=bits^(bits>>32);
     }
     bool empty()const{return value.empty();}
+    bool indirect()const{return value.indirect();}
     bool operator==(const ReversibleEventId& other)const{return value==other.value;}
     bool operator<(const ReversibleEventId& other)const {
         const bool indirect=value.indirect(),other_indirect=other.value.indirect();

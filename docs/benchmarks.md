@@ -495,3 +495,20 @@ The worker pool reserves route buffers in parallel. On the 20M benchmark,
 this lowered peak RSS by about 140 MiB and improved the five-pair medians
 from **1.329 to 1.293 seconds** and from **1.311 to 1.294 seconds**. Every
 output matched. Use `--serial-route-reserve` to compare the original allocation.
+
+## Refreshed generator with mixed-length IDs
+
+The preceding 20M timings used the earlier public generator. The refreshed
+generator and its matching dev answers introduced mixed-length IDs. The
+timings below use a fresh seed-7 set with 20M requested events, 5M clicks,
+and about 2 GiB of CSV. Each timed output is compared with the single-thread
+C++ reference for that dataset. [Official track files](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+Deduplication keeps the computed hash alongside event IDs held as mapped
+views. It still compares their original bytes to decide equality. Inline
+event IDs use the compact 16-byte location record. The first five-pair
+run improved from **1.240 to 1.105 seconds**. The production-default
+build repeated the gain from **1.236 to 1.139 seconds**. Deduplication
+took **0.067 seconds** in the profiled candidate run and **0.209 seconds**
+in its control. All outputs matched. Use `--uncached-indirect-events` to
+time the original deduplication path on mixed-length inputs.

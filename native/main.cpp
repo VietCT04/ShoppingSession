@@ -60,6 +60,16 @@ struct Raw {EventId id;Key person;int64_t ts,ingest;uint32_t price,category;};
 struct RawLocation {EventId id;int64_t ingest;uint64_t location;};
 struct NarrowRawLocation {EventId id;NarrowLocation location;};
 static_assert(sizeof(NarrowRawLocation)==sizeof(EventId)+8);
+struct CachedEventKey {
+    EventId original;
+    size_t hash;
+    bool empty()const{return original.empty();}
+    bool operator==(const CachedEventKey& other)const{return hash==other.hash&&original==other.original;}
+};
+struct CachedEventHash {
+    size_t operator()(const CachedEventKey& id)const noexcept{return id.hash;}
+};
+struct CachedRawLocation {CachedEventKey id;NarrowLocation location;};
 template<class R>constexpr bool is_location_record=std::is_same_v<R,RawLocation>||std::is_same_v<R,NarrowRawLocation>;
 struct CompactRaw {
     EventId id;
@@ -157,6 +167,7 @@ struct Options {
     bool raw_arena=true;
     bool mark_duplicate_events=true;
     bool narrow_duplicate_locations=true;
+    bool cache_indirect_events=true;
     bool branchless_event_validation=true;
     bool reserve_routes=true;
     bool parallel_route_reserve=true;
@@ -235,6 +246,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--copy-dedup-winners")o.mark_duplicate_events=false;
         else if(arg=="--narrow-duplicate-locations")o.narrow_duplicate_locations=true;
         else if(arg=="--wide-duplicate-locations")o.narrow_duplicate_locations=false;
+        else if(arg=="--cached-indirect-events")o.cache_indirect_events=true;
+        else if(arg=="--uncached-indirect-events")o.cache_indirect_events=false;
         else if(arg=="--branchless-event-validation")o.branchless_event_validation=true;
         else if(arg=="--conditional-event-validation")o.branchless_event_validation=false;
         else if(arg=="--reserve-routes")o.reserve_routes=true;
@@ -491,7 +504,8 @@ struct Pipeline {
         }
         return type=="purchase"?2:0;
     }
-    template<class R,class Buffer> void parse_events(std::vector<std::vector<Buffer>>& raw) {
+    template<class R,class Buffer> void parse_events(std::vector<std::vector<Buffer>>& raw,
+                                                     [[maybe_unused]] Workers<CachedRawLocation>* indirect) {
         parallel(in.events.size()+size_t(o.overlap_links),o.threads,[&](size_t i,int worker){
             if(o.overlap_links) {
                 // This job owns the link graph. The other jobs carry raw user
@@ -524,7 +538,8 @@ struct Pipeline {
                 EventId event_id(f[0]);
                 Key user_id(f[1]);
                 Key person=o.overlap_links?user_id:canonical(user_id);
-                size_t bucket=EventIdHash{}(event_id)&(o.ingest_shards-1);
+                const size_t hash=EventIdHash{}(event_id);
+                size_t bucket=hash&(o.ingest_shards-1);
                 if constexpr(is_location_record<R>) {
                     size_t destination=0,index=0;
                     if(valid) {
@@ -534,8 +549,14 @@ struct Pipeline {
                         index=target.size()+1;
                         target.push_back({person,uint32_t(ts-start),uint32_t(price)|(category<<24)});
                     }
-                    if constexpr(std::is_same_v<R,NarrowRawLocation>)
-                        raw[worker][bucket].push_back({event_id,location_codec->encode(ingest,worker,destination,index)});
+                    if constexpr(std::is_same_v<R,NarrowRawLocation>) {
+                        auto location=location_codec->encode(ingest,worker,destination,index);
+#ifdef SHOP_SHORT_IDS
+                        if(indirect&&event_id.indirect())(*indirect)[worker][bucket].push_back({{event_id,hash},location});
+                        else
+#endif
+                        raw[worker][bucket].push_back({event_id,location});
+                    }
                     else raw[worker][bucket].push_back({event_id,ingest,LocationCodec::wide_position(worker,destination,index)});
                 } else if constexpr(std::is_same_v<R,CompactRaw>) {
                     uint32_t offset=valid?uint32_t(ts-start):CompactRaw::invalid;
@@ -554,14 +575,17 @@ struct Pipeline {
     // Records already reside in their user partitions. Only losing copies
     // need a write after the earliest-ingest comparison.
     template<class R,class Buffer>void mark_duplicate_locations(std::vector<std::vector<Buffer>>& raw) {
+        constexpr bool cached=std::is_same_v<R,CachedRawLocation>;
+        using DedupKey=std::conditional_t<cached,CachedEventKey,EventId>;
+        using DedupHash=std::conditional_t<cached,CachedEventHash,EventIdHash>;
         auto drop=[&](const R& row) {
             uint64_t location;
-            if constexpr(std::is_same_v<R,NarrowRawLocation>)location=location_codec->decode(row.location);
+            if constexpr(cached||std::is_same_v<R,NarrowRawLocation>)location=location_codec->decode(row.location);
             else location=row.location;
             if(location)routed_events[location>>48][(location>>32)&65535][uint32_t(location)-1].offset=CompactRaw::invalid;
         };
         auto earlier=[&](const R& a,const R& b) {
-            if constexpr(std::is_same_v<R,NarrowRawLocation>)return location_codec->earlier(a.location,b.location);
+            if constexpr(cached||std::is_same_v<R,NarrowRawLocation>)return location_codec->earlier(a.location,b.location);
             else return a.ingest<b.ingest;
         };
         parallel(o.ingest_shards,o.threads,[&](size_t s,int) {
@@ -573,7 +597,7 @@ struct Pipeline {
             std::vector<std::vector<R>> rows(partitions);
             for(auto& part:rows)part.reserve(count/partitions+count/partitions/8+16);
             for(auto& worker:raw) {
-                for(const auto& row:worker[s])rows[event_shard(row.id)>>shift].push_back(row);
+                for(const auto& row:worker[s])rows[(DedupHash{}(row.id)&(o.dedup_shards-1))>>shift].push_back(row);
                 release_raw(worker[s]);
             }
             for(const auto& part:rows) {
@@ -582,13 +606,13 @@ struct Pipeline {
                 std::vector<uint16_t> tags;
                 tags.reserve(part.size());
                 for(const auto& row:part) {
-                    uint16_t tag=uint64_t(EventIdHash{}(row.id))>>32;
+                    uint16_t tag=uint64_t(DedupHash{}(row.id))>>32;
                     tags.push_back(tag);
                     uint64_t bit=uint64_t{1}<<(tag&63);
                     repeated[tag>>6]|=seen[tag>>6]&bit;
                     seen[tag>>6]|=bit;
                 }
-                EventIdFlatMap<size_t> winners;
+                FlatMap<size_t,DedupKey,DedupHash> winners;
                 winners.reserve(part.size()/8);
                 for(size_t i=0;i<part.size();++i) {
                     uint16_t tag=tags[i];
@@ -1239,11 +1263,23 @@ struct Pipeline {
         parquet::write((o.out/"campaign_daily"/"part-0.parquet").string(),cols);
     }
     template<class R> void ingest_and_dedup(Timer& timer) {
+        std::unique_ptr<Workers<CachedRawLocation>> indirect;
+#ifdef SHOP_SHORT_IDS
+        if constexpr(std::is_same_v<R,NarrowRawLocation>) {
+            if(o.cache_indirect_events)
+                indirect=std::make_unique<Workers<CachedRawLocation>>(o.threads,Buckets<CachedRawLocation>(o.ingest_shards));
+        }
+#endif
         auto process_raw=[&](auto& raw) {
-            parse_events<R>(raw);
+            parse_events<R>(raw,indirect.get());
             timer.mark(o.overlap_links?"parse_events_and_links":"parse_events");
             if constexpr(is_location_record<R>)mark_duplicate_locations<R>(raw);
             else dedup<R>(raw);
+#ifdef SHOP_SHORT_IDS
+            if constexpr(std::is_same_v<R,NarrowRawLocation>) {
+                if(indirect)mark_duplicate_locations<CachedRawLocation>(*indirect);
+            }
+#endif
             timer.mark("dedup");
         };
         if(o.raw_arena&&!o.baseline&&!in.events.empty()) {
