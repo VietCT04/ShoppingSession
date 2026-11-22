@@ -5,7 +5,7 @@ WORKDIR /generator
 COPY tools/generator/Cargo.toml tools/generator/Cargo.lock ./
 COPY tools/generator/src/ src/
 RUN cargo build --release --locked --offline && \
-    target/release/generate --seed 42 --events 1000000 --clicks 250000 --threads 8 --output /training
+    target/release/generate --seed 66 --events 4000000 --clicks 1000000 --threads 8 --output /training
 
 FROM gcc:14-bookworm AS compiler
 WORKDIR /src

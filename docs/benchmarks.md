@@ -543,6 +543,12 @@ runs used the Dockerfile's GCC and Debian base images in local Linux
 namespaces with eight pinned CPUs, a 24 GiB cgroup limit, and swap disabled.
 These results exclude Docker daemon and scorer overhead.
 
+GCC 14 training on a separate seed-66 set with 4M events and 1M clicks
+improved the alternating 20M run medians from **1.407 to 1.335 seconds**
+and from **1.242 to 1.126 seconds**. The larger profile won 11 of 14 pairs,
+and both output tables matched in every run. The Dockerfile uses this
+training set by default.
+
 A second five-pair batch used the same PGO binary for both output layouts.
 `--worker-parquet` reduced `user_daily` from 512 files to 8 and measured
 **1.146 s vs 1.162 s** for shard files. It won two of five pairs, so shard
