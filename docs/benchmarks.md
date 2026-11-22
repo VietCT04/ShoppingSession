@@ -442,3 +442,10 @@ provides routing and fingerprint bits while keeping exact equality. Unusual
 IDs retain their original mapped bytes. Two five-pair 20M sets measured
 **1.343 vs 1.350 seconds** and **1.343 vs 1.359 seconds**, with exact reference
 matches in every run. Define `SHOP_PLAIN_EVENT_HASH` to build the control.
+
+The profile-guided build with reversible event IDs measured a **0.948-second**
+median over five pinned 20M runs. The ordinary build measured **1.034 seconds**
+in the same alternating batch. The fastest complete run took **0.930 seconds**.
+Both tables matched the full reference every time. The same profile-guided
+binary passed all 36 fixtures, the official dev comparison, and a separate
+default-settings 20M run.
