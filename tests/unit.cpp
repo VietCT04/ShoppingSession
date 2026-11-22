@@ -137,19 +137,25 @@ int main(){try{
     }
     {
         struct Event {uint32_t ts;};
-        GapSessions bins;
+        GapSessions<> bins;
+        GapSessions<true> sparse_bins;
         const uint32_t gap=uint32_t(GAP),limit=100*gap;
         auto compare_sessions=[&](std::vector<Event> events) {
             auto summarized=bins.summarize(std::span(events),limit);
+            auto sparse=sparse_bins.summarize(std::span(events),limit);
+            require(sparse.size()==summarized.size(),"occupied bins produce the same session count");
             std::sort(events.begin(),events.end(),[](const auto& a,const auto& b){return a.ts<b.ts;});
             size_t session=0;
             for(size_t first=0;first<events.size();) {
                 size_t last=first+1;
                 while(last<events.size()&&events[last].ts-events[last-1].ts<=gap)++last;
                 require(session<summarized.size(),"every sorted session has a gap summary");
-                const auto& actual=summarized[session++];
+                const auto& actual=summarized[session];
+                const auto& occupied=sparse[session++];
                 require(actual.ts==events[first].ts&&actual.last==events[last-1].ts&&actual.count==last-first,
                         "gap summaries preserve exact boundaries and event counts");
+                require(occupied.ts==actual.ts&&occupied.last==actual.last&&occupied.count==actual.count,
+                        "occupied bins preserve boundaries and reset between users");
                 first=last;
             }
             require(session==summarized.size(),"gap bins produce no extra sessions");

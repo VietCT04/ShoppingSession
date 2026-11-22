@@ -203,6 +203,11 @@ int main(int argc,char** argv) {
             configs.back().flags.insert(configs.back().flags.end(),{"--gap-bin-min-events","256"});
             configs.push_back({"gap-bin-sessions-1024",gap_bin_control});
             configs.back().flags.insert(configs.back().flags.end(),{"--gap-bin-min-events","1024"});
+            auto sparse_bin_control=configs.back().flags;
+            for(const char* threshold:{"16","48","128"}) {
+                configs.push_back({std::string("sparse-bin-sessions-")+threshold,sparse_bin_control});
+                configs.back().flags.insert(configs.back().flags.end(),{"--sparse-bin-min-events",threshold});
+            }
             if(std::getenv("BINARY_SHORT"))configs.push_back({"short-ids",configs.back().flags});
             configs.push_back({"heavy-shards",tier_control});
             configs.back().flags.push_back("--heavy-shards-first");
@@ -231,7 +236,7 @@ int main(int argc,char** argv) {
                     std::vector<std::string> args={binary?binary:"build/shopping",argv[2],out.string()};args.insert(args.end(),config.flags.begin(),config.flags.end());
                     // Matrix entries start from fixed defaults rather than the
                     // tuned production defaults. Explicit flags override these.
-                    args.insert(args.begin()+3,{"--gap-bin-min-events","0","--defer-isolated-groups","--wide-assist-counters","--transient-workers","--inline-group-purchases","--no-cache-utc-days","--grow-routes","--conditional-event-validation"});
+                    args.insert(args.begin()+3,{"--sparse-bin-min-events","0","--gap-bin-min-events","0","--defer-isolated-groups","--wide-assist-counters","--transient-workers","--inline-group-purchases","--no-cache-utc-days","--grow-routes","--conditional-event-validation"});
                     args.insert(args.begin()+3,{"--wide-duplicate-locations","--copy-dedup-winners","--vector-raw","--generic-aggregation","--no-redirect-linked-groups","--wide-count-columns","--unbatched-link-probes","--legacy-link-input","--wide-routing","--no-row-csv","--no-inline-short-links","--wide-raw","--no-sparse-duplicates","--no-avx2-csv","--no-tag-links","--ingest-shards","0","--no-overlap-links","--no-direct-encoding","--wide-events","--no-fast-time","--no-compact","--no-array-active","--no-array-categories","--dedup-shards","0","--no-fused-csv","--no-group-person","--no-dense-totals","--sorter","std"});
                     auto log=fs::path("benchmarks")/(config.name+"-"+std::to_string(i)+".log");
                     auto r=run(args,log);compare(db,out,argv[3]);times[index].push_back(r.seconds);

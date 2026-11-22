@@ -165,6 +165,7 @@ struct Options {
     bool compact_assist_counters=true;
     bool fuse_isolated_groups=true;
     size_t gap_bin_min_events=256;
+    size_t sparse_bin_min_events=16;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -248,6 +249,7 @@ Options options(int argc,char** argv) {
         else if(arg=="--fuse-isolated-groups")o.fuse_isolated_groups=true;
         else if(arg=="--defer-isolated-groups")o.fuse_isolated_groups=false;
         else if(arg=="--gap-bin-min-events"&&i+1<argc)o.gap_bin_min_events=std::stoull(argv[++i]);
+        else if(arg=="--sparse-bin-min-events"&&i+1<argc)o.sparse_bin_min_events=std::stoull(argv[++i]);
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -908,8 +910,13 @@ struct Pipeline {
                 auto purchases=group.purchases;
                 if(purchases.size()>1)sort_group(purchases.data(),purchases.data()+purchases.size(),
                     [](auto& a,auto& b){return a.ts<b.ts;});
+                if(o.gap_bin_min_events&&o.sparse_bin_min_events&&ev.size()>=o.sparse_bin_min_events&&ev.size()<1024) {
+                    thread_local GapSessions<true> sparse_bins;
+                    consume(group.name,sparse_bins.summarize(ev,uint32_t(end-start-1)),cl,start,start-WEEK,purchases);
+                    return;
+                }
                 if(o.gap_bin_min_events&&ev.size()>=o.gap_bin_min_events) {
-                    thread_local GapSessions bins;
+                    thread_local GapSessions<> bins;
                     consume(group.name,bins.summarize(ev,uint32_t(end-start-1)),cl,start,start-WEEK,purchases);
                     return;
                 }

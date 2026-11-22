@@ -484,3 +484,9 @@ seconds** in the same alternating batch. The fastest new run took **0.898
 seconds**, and all ten outputs matched the full reference. The new binary
 also passed the 36 default fixtures, the official dev comparison, and an
 independent default-settings 20M run.
+
+Groups of 16 to 1,023 events keep a bitmap of occupied time bins. Visiting
+only those bins removes the full bin scan for medium-sized groups. Two
+five-pair 20M batches measured **1.331 vs 1.336 seconds** and **1.300 vs
+1.322 seconds** against the dense-bin build. Every output matched the
+reference. Use `--sparse-bin-min-events 0` to time the dense-bin policy.
