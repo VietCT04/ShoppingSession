@@ -161,6 +161,7 @@ struct Options {
     bool cache_utc_days=true;
     bool split_group_purchases=true;
     bool persistent_workers=true;
+    bool compact_assist_counters=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -239,6 +240,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--inline-group-purchases")o.split_group_purchases=false;
         else if(arg=="--persistent-workers")o.persistent_workers=true;
         else if(arg=="--transient-workers")o.persistent_workers=false;
+        else if(arg=="--compact-assist-counters")o.compact_assist_counters=true;
+        else if(arg=="--wide-assist-counters")o.compact_assist_counters=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -291,6 +294,7 @@ struct Pipeline {
     Workers<RoutedClick> routed_clicks;
     std::vector<CampaignTotals> totals;
     std::vector<std::vector<Aggregate>> dense_totals;
+    std::vector<std::vector<uint32_t>> dense_assists;
     std::vector<WorkProfile> profiles;
     std::unique_ptr<LocationCodec> location_codec;
     std::unique_ptr<WorkerPool> workers;
@@ -366,6 +370,15 @@ struct Pipeline {
         if(!o.overlap_links)build_links();
         for(auto p:files(o.data/"events"))in.add(p,in.events);
         for(auto p:files(o.data/"clicks"))in.add(p,in.clicks);
+        if(o.compact_assist_counters&&o.redirect_linked_groups&&o.specialize_aggregation&&
+           o.array_active&&o.array_categories&&o.dense_totals) {
+            size_t bytes=0;
+            for(auto chunk:in.events)bytes+=chunk.end-chunk.begin;
+            // Each accepted event row has six commas. A campaign assists
+            // each session at most once, and every session has an event.
+            if(bytes/6<=UINT32_MAX)
+                dense_assists.assign(o.threads,std::vector<uint32_t>(dense_totals.front().size()));
+        }
         if(o.reserve_routes) {
             reserve_routes(routed_events,in.events,64);
             reserve_routes(routed_clicks,in.clicks,40);
@@ -1051,6 +1064,7 @@ struct Pipeline {
                 int64_t day=-1,ns=0,ne=0,nr=0;
                 std::conditional_t<Arrays,Unused,std::unordered_map<uint32_t,int64_t>> cat_revenue;
                 Aggregate* day_totals=nullptr;
+                uint32_t* day_assists=nullptr;
                 auto totals_for=[&](uint32_t campaign)->Aggregate& {
                     if constexpr(Arrays)return day_totals[campaign];
                     else return total(worker,day,campaign);
@@ -1073,8 +1087,11 @@ struct Pipeline {
                     const int64_t st=time_base+ev[i].ts,sd=dayof(st);
                     if(sd!=day) {
                         flush();day=sd;
-                        if constexpr(Arrays)
-                            day_totals=dense_totals[worker].data()+size_t(day-dayof(start))*campaign_names.size();
+                        if constexpr(Arrays) {
+                            size_t offset=size_t(day-dayof(start))*campaign_names.size();
+                            day_totals=dense_totals[worker].data()+offset;
+                            if(!dense_assists.empty())day_assists=dense_assists[worker].data()+offset;
+                        }
                     }
                     size_t j=i+1;while(j<ev.size()&&ev[j].ts-ev[j-1].ts<=GAP)++j;
                     int64_t revenue=0;
@@ -1114,7 +1131,8 @@ struct Pipeline {
                         while(hi<cl.size()&&cl[hi].ts<=click_at){campaign_window.add(cl[hi].campaign);++hi;}
                         while(lo<hi&&cl[lo].ts<click_at-WEEK){campaign_window.remove(cl[lo].campaign);++lo;}
                         if(hi>lo)credited=cl[hi-1].campaign;
-                        for(auto cam:campaign_window.present)++totals_for(cam).assisted;
+                        if(day_assists)for(auto cam:campaign_window.present)++day_assists[cam];
+                        else for(auto cam:campaign_window.present)++totals_for(cam).assisted;
                     } else if constexpr(!Arrays) {
                         while(hi<cl.size()&&cl[hi].ts<=click_at){++active[cl[hi].campaign];++hi;}
                         while(lo<hi&&cl[lo].ts<click_at-WEEK){auto it=active.find(cl[lo].campaign);if(!--it->second)active.erase(it);++lo;}
@@ -1135,7 +1153,11 @@ struct Pipeline {
         if(o.dense_totals) {
             for(size_t i=0;i<dense_totals[0].size();++i) {
                 Aggregate a;
-                for(auto& w:dense_totals){const auto& t=w[i];a.sessions+=t.sessions;a.purchasing+=t.purchasing;a.revenue+=t.revenue;a.assisted+=t.assisted;}
+                for(size_t worker=0;worker<dense_totals.size();++worker) {
+                    const auto& t=dense_totals[worker][i];
+                    a.sessions+=t.sessions;a.purchasing+=t.purchasing;a.revenue+=t.revenue;a.assisted+=t.assisted;
+                    if(!dense_assists.empty())a.assisted+=dense_assists[worker][i];
+                }
                 if(a.sessions||a.assisted)all[{dayof(start)+i/campaign_names.size(),i%campaign_names.size()}]=a;
             }
         }

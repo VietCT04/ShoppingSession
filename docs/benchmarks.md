@@ -455,3 +455,9 @@ session tasks. It joins each stage at a barrier and passes worker failures
 back to the caller. The five-pair 20M medians improved from **1.427 to 1.415
 seconds** and from **1.423 to 1.405 seconds**, with exact outputs in both
 batches. Use `--transient-workers` to compare per-stage thread creation.
+
+Campaign assists use a contiguous array of 32-bit counters when the input
+size proves that they fit. Final reduction still uses 64-bit counters. The
+five-pair 20M medians were **1.350 vs 1.352 seconds** with persistent workers
+and **1.359 vs 1.380 seconds** in an earlier batch. All outputs matched the
+reference. Use `--wide-assist-counters` to compare the wider layout.
