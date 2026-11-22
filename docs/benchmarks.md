@@ -461,3 +461,11 @@ size proves that they fit. Final reduction still uses 64-bit counters. The
 five-pair 20M medians were **1.350 vs 1.352 seconds** with persistent workers
 and **1.359 vs 1.380 seconds** in an earlier batch. All outputs matched the
 reference. Use `--wide-assist-counters` to compare the wider layout.
+
+Users absent from the identity-link graph can be sessionized immediately
+after their events and clicks are grouped. Their rows are written from the
+source partition while it is still in cache. Linked aliases are collected
+for canonical-person processing. The five-pair 20M median improved from
+**1.337 to 1.321 seconds** with compact assist counters and **1.352 to 1.325
+seconds** in an earlier batch. All outputs matched the reference. Use
+`--defer-isolated-groups` to compare the single aggregation pass.

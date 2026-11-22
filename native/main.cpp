@@ -162,6 +162,7 @@ struct Options {
     bool split_group_purchases=true;
     bool persistent_workers=true;
     bool compact_assist_counters=true;
+    bool fuse_isolated_groups=true;
     std::string dedup="flat";
     std::string sorter="duckdb";
     std::string group_sort="duckdb";
@@ -242,6 +243,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--transient-workers")o.persistent_workers=false;
         else if(arg=="--compact-assist-counters")o.compact_assist_counters=true;
         else if(arg=="--wide-assist-counters")o.compact_assist_counters=false;
+        else if(arg=="--fuse-isolated-groups")o.fuse_isolated_groups=true;
+        else if(arg=="--defer-isolated-groups")o.fuse_isolated_groups=false;
         else if(arg=="--threads"&&i+1<argc)o.threads=std::stoi(argv[++i]);
         else if(arg=="--shards"&&i+1<argc)o.shards=std::stoi(argv[++i]);
         else if(arg=="--dedup-shards"&&i+1<argc)o.dedup_shards=std::stoi(argv[++i]);
@@ -892,6 +895,20 @@ struct Pipeline {
             std::span<LinkedClick> clicks;
             [[no_unique_address]] std::conditional_t<SplitPurchases,std::span<LinkedEvent>,NoPurchases> purchases;
         };
+        const bool specialized=o.specialize_aggregation&&o.array_active&&o.array_categories&&o.dense_totals;
+        auto consume_group=[&](const Group& group,auto& consume) {
+            auto ev=group.events;
+            auto cl=group.clicks;
+            if(ev.empty())return;
+            sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
+            if(cl.size()>1)sort_group(cl.data(),cl.data()+cl.size(),[](auto& a,auto& b){return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;});
+            if constexpr(SplitPurchases) {
+                auto purchases=group.purchases;
+                if(purchases.size()>1)sort_group(purchases.data(),purchases.data()+purchases.size(),
+                    [](auto& a,auto& b){return a.ts<b.ts;});
+                consume(group.name,ev,cl,start,start-WEEK,purchases);
+            } else consume(group.name,ev,cl,start,start-WEEK);
+        };
         std::vector<Source> sources(o.shards);
         Workers<Group> grouped(o.threads,Buckets<Group>(o.shards));
         parallel(o.shards,o.threads,[&](size_t s,int worker) {
@@ -932,17 +949,39 @@ struct Pipeline {
             source.clicks=group_records<ClickInput,LinkedClick>(cl,click_counts,[](const ClickInput& row){return row.click;});
             if constexpr(SplitPurchases)source.purchases=group_records<PurchaseInput,LinkedEvent>(purchases,purchase_counts,
                 [](const PurchaseInput& row){return row.event;});
+            std::vector<Group> isolated;
+            size_t isolated_events=0;
             for(size_t i=0;i<names.size();++i) {
-                Key person=canonical(names[i]);
+                Key person=names[i];
+                bool independent=false;
+#ifdef SHOP_SHORT_IDS
+                if(o.fuse_isolated_groups&&people.inlined) {
+                    if(auto* entry=people.index.find(person))person.word=entry->second;
+                    else independent=true;
+                } else
+#endif
+                person=canonical(person);
                 size_t destination=person==names[i]?s:shard(person);
                 Group group{person,
                     {source.events.data.get()+event_counts[i],event_counts[i+1]-event_counts[i]},
                     {source.clicks.data.get()+click_counts[i],click_counts[i+1]-click_counts[i]}};
                 if constexpr(SplitPurchases)group.purchases={source.purchases.data.get()+purchase_counts[i],
                     purchase_counts[i+1]-purchase_counts[i]};
-                grouped[worker][destination].push_back(group);
+                if(independent) {
+                    // An ID absent from the full link graph cannot receive
+                    // events or clicks from any other source partition.
+                    if(!group.events.empty()) {
+                        isolated_events+=group.events.size();
+                        isolated.push_back(group);
+                    }
+                } else grouped[worker][destination].push_back(group);
             }
             profiles[worker].intern+=elapsed(before);
+            if(!isolated.empty()) {
+                auto enumerate=[&](auto consume){for(const auto& group:isolated)consume_group(group,consume);};
+                if(specialized)aggregate_users<true>(s,worker,isolated_events,enumerate,"part-independent-");
+                else aggregate_users(s,worker,isolated_events,enumerate,"part-independent-");
+            }
         });
         parallel(o.shards,o.threads,[&](size_t s,int worker) {
             auto before=Clock::now();
@@ -958,9 +997,7 @@ struct Pipeline {
                 for(size_t i=0;i<groups.size();) {
                     size_t finish=i+1;
                     while(finish<groups.size()&&groups[finish].name==groups[i].name)++finish;
-                    auto ev=groups[i].events;
-                    auto cl=groups[i].clicks;
-                    auto purchases=groups[i].purchases;
+                    Group group=groups[i];
                     if(finish>i+1) {
                         merged_events.clear();merged_clicks.clear();
                         if constexpr(SplitPurchases)merged_purchases.clear();
@@ -970,22 +1007,14 @@ struct Pipeline {
                             if constexpr(SplitPurchases)merged_purchases.insert(merged_purchases.end(),
                                 groups[j].purchases.begin(),groups[j].purchases.end());
                         }
-                        ev=std::span(merged_events);cl=std::span(merged_clicks);
-                        if constexpr(SplitPurchases)purchases=std::span(merged_purchases);
+                        group.events=std::span(merged_events);group.clicks=std::span(merged_clicks);
+                        if constexpr(SplitPurchases)group.purchases=std::span(merged_purchases);
                     }
-                    if(!ev.empty()) {
-                        sort_group(ev.data(),ev.data()+ev.size(),[](auto& a,auto& b){return a.ts<b.ts;});
-                        if(cl.size()>1)sort_group(cl.data(),cl.data()+cl.size(),[](auto& a,auto& b){return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;});
-                        if constexpr(SplitPurchases) {
-                            if(purchases.size()>1)sort_group(purchases.data(),purchases.data()+purchases.size(),
-                                [](auto& a,auto& b){return a.ts<b.ts;});
-                            consume(groups[i].name,ev,cl,start,start-WEEK,purchases);
-                        } else consume(groups[i].name,ev,cl,start,start-WEEK);
-                    }
+                    consume_group(group,consume);
                     i=finish;
                 }
             };
-            if(o.specialize_aggregation&&o.array_active&&o.array_categories&&o.dense_totals)
+            if(specialized)
                 aggregate_users<true>(s,worker,event_count,enumerate);
             else aggregate_users(s,worker,event_count,enumerate);
         });
@@ -1046,7 +1075,8 @@ struct Pipeline {
                 }
             });
     }
-    template<bool Arrays=false,class Enumerate>void aggregate_users(size_t s,int worker,size_t event_count,Enumerate enumerate) {
+    template<bool Arrays=false,class Enumerate>void aggregate_users(size_t s,int worker,size_t event_count,Enumerate enumerate,
+                                                                    const char* output_prefix="part-") {
             auto before=Clock::now();
             using parquet::Column;
             const int count_type=o.narrow_count_columns&&event_count<=INT32_MAX?1:2;
@@ -1145,7 +1175,7 @@ struct Pipeline {
                 flush();
             });
             profiles[worker].aggregate+=elapsed(before);before=Clock::now();
-            if(cols[0].count||s==0)parquet::write((o.out/"user_daily"/("part-"+std::to_string(s)+".parquet")).string(),cols);
+            if(cols[0].count||s==0)parquet::write((o.out/"user_daily"/(output_prefix+std::to_string(s)+".parquet")).string(),cols);
             profiles[worker].parquet+=elapsed(before);
     }
     void campaigns_output() {
