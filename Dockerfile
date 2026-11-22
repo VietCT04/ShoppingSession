@@ -18,6 +18,7 @@ FROM compiler AS plain-build
 RUN make all && mv build/shopping /shopping
 
 FROM compiler AS pgo-build
+ENV SHOP_INGEST_DAG=interleave
 COPY --from=profile-data /training /training
 RUN make pgo PGO_DATA=/training && mv build/shopping-pgo /shopping
 

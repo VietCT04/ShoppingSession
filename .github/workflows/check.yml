@@ -21,6 +21,7 @@ jobs:
           CPUS: "4"
           MEM: 6g
           NCPU: "8"
+          SHOP_INGEST_DAG: interleave
         run: |
           FIXTURE_SINGLE=1 build/check fixtures scripts/docker_run.sh
           sh scripts/docker_run.sh data/dev out-container

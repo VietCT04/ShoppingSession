@@ -31,5 +31,5 @@ docker run --rm --platform "$PLATFORM" \
   -v "$DATA":/data:ro,z -v "$OUT":/output:z -v "$SCRATCH":/scratch:z \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
   -e NCPU="${NCPU:-${CPUS%.*}}" -e MEM_GB="${MEM%g}" \
-  -e SHOP_PROFILE_CPU -e SHOP_PROFILE_DETAIL \
+  -e SHOP_PROFILE_CPU -e SHOP_PROFILE_DETAIL -e SHOP_INGEST_DAG -e SHOP_FUSE_DEDUP_CLICKS \
   "$IMAGE" "$@"

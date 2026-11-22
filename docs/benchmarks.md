@@ -570,3 +570,17 @@ were **445 ms for links** and **498 ms for event CSV**. The link worker took
 workers finished first and the link job added **92 ms** at the barrier.
 The ordinary build finished links last in three of five runs, adding **4,
 17, and 45 ms**. Both reference tables matched in every run.
+
+### Ingestion task DAG on `perf/ingestion-task-dag`
+
+`SHOP_INGEST_DAG=interleave` lets link resolution, event parsing, and click
+parsing share the same worker pool. The final event task publishes all event
+buffers before releasing deduplication jobs. The pool then completes links,
+deduplication, and clicks before grouping starts. `SHOP_INGEST_DAG=tail`
+puts clicks after event parsing in the ready queue. `SHOP_FUSE_DEDUP_CLICKS=1`
+combines only the deduplication and click phases for comparison. Running
+without either setting uses the original schedule.
+
+The modes passed the 36 official fixtures and exact dev comparisons. The
+20M comparator checks both output tables for every timed run. The experiment
+applies to the packed path that defers linked-user resolution until grouping.

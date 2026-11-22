@@ -347,6 +347,7 @@ struct Pipeline {
     std::unique_ptr<LocationCodec> location_codec;
     std::unique_ptr<WorkerPool> workers;
     bool cache_user_hashes=false;
+    bool clicks_parsed=false;
     const bool profile_detail=std::getenv("SHOP_PROFILE_DETAIL")!=nullptr;
     explicit Pipeline(Options options):o(std::move(options)),
         events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
@@ -538,6 +539,69 @@ struct Pipeline {
         }
         return type=="purchase"?2:0;
     }
+    template<class R,class Buffer>void parse_event_chunk(std::vector<std::vector<Buffer>>& raw,
+                                                        size_t i,int worker,[[maybe_unused]] CachedEventBuckets* indirect) {
+        records<7>(in.events[i],[&](const std::array<SV,7>& f){
+            if(f[0].empty())return;
+            // Invalid winners remain in the dedup input. A later valid copy
+            // must never rescue an invalid earliest copy.
+            int64_t ts=parse_time(f[2]),ingest=o.ordered_ingest?IngestOrder::pack(f[3]):parse_time(f[3]);
+            uint64_t price=0;uint32_t category=0;
+            bool purchase,valid;
+            if(o.branchless_event_validation&&!o.ordered_ingest) {
+                unsigned type=classify_event(f[4]);
+                purchase=type==2;
+                bool late=(ingest>ts)&(uint64_t(ingest)-uint64_t(ts)>uint64_t(DAY));
+                valid=!f[1].empty()&!f[5].empty()&(type!=0)&(ts>=start)&(ts<end)&!late;
+            } else {
+                purchase=f[4]=="purchase";
+                valid=!f[1].empty()&&!f[5].empty()&&(purchase||f[4]=="view"||f[4]=="cart")&&
+                    ts>=start&&ts<end&&(o.ordered_ingest?ingest_order.on_time(ingest,ts):ingest-ts<=DAY);
+            }
+            if(purchase) {
+                valid=valid&&digits(f[6],price,10000000)&&price>0;
+                if(valid){auto it=products.find(f[5]);if(it!=products.end())category=it->second;}
+            }
+            if(!valid)ts=-1;
+            EventId event_id(f[0]);
+            Key user_id(f[1]);
+            Key person=o.overlap_links?user_id:canonical(user_id);
+            const size_t hash=EventIdHash{}(event_id);
+            size_t bucket=hash&(o.ingest_shards-1);
+            if constexpr(is_location_record<R>) {
+                size_t destination=0,index=0;
+                if(valid) {
+                    const size_t person_hash=KeyHash{}(person);
+                    destination=person_hash&(o.shards-1);
+                    uint32_t offset=uint32_t(ts-start),payload=uint32_t(price)|(category<<24);
+                    if(cache_user_hashes&&!price) {
+                        // The purchase payload is free on views and carts.
+                        offset|=route_hash_bit;
+                        payload=uint64_t(person_hash)>>32;
+                    }
+                    auto& target=routed_events[worker][destination];
+                    if(target.size()>=UINT32_MAX)throw std::runtime_error("too many events in one worker partition");
+                    index=target.size()+1;
+                    target.push_back({person,offset,payload});
+                }
+                if constexpr(std::is_same_v<R,NarrowRawLocation>) {
+                    auto location=location_codec->encode(ingest,worker,destination,index);
+#ifdef SHOP_SHORT_IDS
+                    if(indirect&&event_id.indirect())(*indirect)[worker][bucket].push_back({{event_id,hash},location});
+                    else
+#endif
+                    raw[worker][bucket].push_back({event_id,location});
+                }
+                else raw[worker][bucket].push_back({event_id,ingest,LocationCodec::wide_position(worker,destination,index)});
+            } else if constexpr(std::is_same_v<R,CompactRaw>) {
+                uint32_t offset=valid?uint32_t(ts-start):CompactRaw::invalid;
+                uint32_t purchase_info=(uint32_t(price)&CompactRaw::price_mask)|(category<<24);
+                raw[worker][bucket].push_back({event_id,person,ingest,offset,purchase_info});
+            } else {
+                raw[worker][bucket].push_back({event_id,person,ts,ingest,uint32_t(price),category});
+            }
+        });
+    }
     template<class R,class Buffer> void parse_events(std::vector<std::vector<Buffer>>& raw,
                                                      [[maybe_unused]] CachedEventBuckets* indirect) {
         struct alignas(64) ParseWorkerTiming {
@@ -561,66 +625,7 @@ struct Pipeline {
                 }
                 --i;
             }
-            records<7>(in.events[i],[&](const std::array<SV,7>& f){
-                if(f[0].empty())return;
-                // Invalid winners remain in the dedup input. A later valid copy
-                // must never rescue an invalid earliest copy.
-                int64_t ts=parse_time(f[2]),ingest=o.ordered_ingest?IngestOrder::pack(f[3]):parse_time(f[3]);
-                uint64_t price=0;uint32_t category=0;
-                bool purchase,valid;
-                if(o.branchless_event_validation&&!o.ordered_ingest) {
-                    unsigned type=classify_event(f[4]);
-                    purchase=type==2;
-                    bool late=(ingest>ts)&(uint64_t(ingest)-uint64_t(ts)>uint64_t(DAY));
-                    valid=!f[1].empty()&!f[5].empty()&(type!=0)&(ts>=start)&(ts<end)&!late;
-                } else {
-                    purchase=f[4]=="purchase";
-                    valid=!f[1].empty()&&!f[5].empty()&&(purchase||f[4]=="view"||f[4]=="cart")&&
-                        ts>=start&&ts<end&&(o.ordered_ingest?ingest_order.on_time(ingest,ts):ingest-ts<=DAY);
-                }
-                if(purchase) {
-                    valid=valid&&digits(f[6],price,10000000)&&price>0;
-                    if(valid){auto it=products.find(f[5]);if(it!=products.end())category=it->second;}
-                }
-                if(!valid)ts=-1;
-                EventId event_id(f[0]);
-                Key user_id(f[1]);
-                Key person=o.overlap_links?user_id:canonical(user_id);
-                const size_t hash=EventIdHash{}(event_id);
-                size_t bucket=hash&(o.ingest_shards-1);
-                if constexpr(is_location_record<R>) {
-                    size_t destination=0,index=0;
-                    if(valid) {
-                        const size_t person_hash=KeyHash{}(person);
-                        destination=person_hash&(o.shards-1);
-                        uint32_t offset=uint32_t(ts-start),payload=uint32_t(price)|(category<<24);
-                        if(cache_user_hashes&&!price) {
-                            // The purchase payload is free on views and carts.
-                            offset|=route_hash_bit;
-                            payload=uint64_t(person_hash)>>32;
-                        }
-                        auto& target=routed_events[worker][destination];
-                        if(target.size()>=UINT32_MAX)throw std::runtime_error("too many events in one worker partition");
-                        index=target.size()+1;
-                        target.push_back({person,offset,payload});
-                    }
-                    if constexpr(std::is_same_v<R,NarrowRawLocation>) {
-                        auto location=location_codec->encode(ingest,worker,destination,index);
-#ifdef SHOP_SHORT_IDS
-                        if(indirect&&event_id.indirect())(*indirect)[worker][bucket].push_back({{event_id,hash},location});
-                        else
-#endif
-                        raw[worker][bucket].push_back({event_id,location});
-                    }
-                    else raw[worker][bucket].push_back({event_id,ingest,LocationCodec::wide_position(worker,destination,index)});
-                } else if constexpr(std::is_same_v<R,CompactRaw>) {
-                    uint32_t offset=valid?uint32_t(ts-start):CompactRaw::invalid;
-                    uint32_t purchase_info=(uint32_t(price)&CompactRaw::price_mask)|(category<<24);
-                    raw[worker][bucket].push_back({event_id,person,ingest,offset,purchase_info});
-                } else {
-                    raw[worker][bucket].push_back({event_id,person,ts,ingest,uint32_t(price),category});
-                }
-            });
+            parse_event_chunk<R>(raw,i,worker,indirect);
             if(measure) {
                 parse_times[worker].last_chunk=Clock::now();
                 ++parse_times[worker].chunks;
@@ -650,7 +655,7 @@ struct Pipeline {
     }
     // Records already reside in their user partitions. Only losing copies
     // need a write after the earliest-ingest comparison.
-    template<class R,class Buffer>void mark_duplicate_locations(std::vector<std::vector<Buffer>>& raw) {
+    template<class R,class Buffer>void mark_duplicate_shard(std::vector<std::vector<Buffer>>& raw,size_t s) {
         constexpr bool cached=std::is_same_v<R,CachedRawLocation>;
         using DedupKey=std::conditional_t<cached,CachedEventKey,EventId>;
         using DedupHash=std::conditional_t<cached,CachedEventHash,EventIdHash>;
@@ -664,44 +669,45 @@ struct Pipeline {
             if constexpr(cached||std::is_same_v<R,NarrowRawLocation>)return location_codec->earlier(a.location,b.location);
             else return a.ingest<b.ingest;
         };
-        parallel(o.ingest_shards,o.threads,[&](size_t s,int) {
-            size_t count=0;
-            for(const auto& worker:raw)count+=worker[s].size();
-            if(!count)return;
-            size_t partitions=o.dedup_shards/o.ingest_shards;
-            unsigned shift=std::countr_zero(unsigned(o.ingest_shards));
-            std::vector<std::vector<R>> rows(partitions);
-            for(auto& part:rows)part.reserve(count/partitions+count/partitions/8+16);
-            for(auto& worker:raw) {
-                for(const auto& row:worker[s])rows[(DedupHash{}(row.id)&(o.dedup_shards-1))>>shift].push_back(row);
-                release_raw(worker[s]);
+        size_t count=0;
+        for(const auto& worker:raw)count+=worker[s].size();
+        if(!count)return;
+        size_t partitions=o.dedup_shards/o.ingest_shards;
+        unsigned shift=std::countr_zero(unsigned(o.ingest_shards));
+        std::vector<std::vector<R>> rows(partitions);
+        for(auto& part:rows)part.reserve(count/partitions+count/partitions/8+16);
+        for(auto& worker:raw) {
+            for(const auto& row:worker[s])rows[(DedupHash{}(row.id)&(o.dedup_shards-1))>>shift].push_back(row);
+            release_raw(worker[s]);
+        }
+        for(const auto& part:rows) {
+            if(part.size()<2)continue;
+            std::array<uint64_t,1024> seen{},repeated{};
+            std::vector<uint16_t> tags;
+            tags.reserve(part.size());
+            for(const auto& row:part) {
+                uint16_t tag=uint64_t(DedupHash{}(row.id))>>32;
+                tags.push_back(tag);
+                uint64_t bit=uint64_t{1}<<(tag&63);
+                repeated[tag>>6]|=seen[tag>>6]&bit;
+                seen[tag>>6]|=bit;
             }
-            for(const auto& part:rows) {
-                if(part.size()<2)continue;
-                std::array<uint64_t,1024> seen{},repeated{};
-                std::vector<uint16_t> tags;
-                tags.reserve(part.size());
-                for(const auto& row:part) {
-                    uint16_t tag=uint64_t(DedupHash{}(row.id))>>32;
-                    tags.push_back(tag);
-                    uint64_t bit=uint64_t{1}<<(tag&63);
-                    repeated[tag>>6]|=seen[tag>>6]&bit;
-                    seen[tag>>6]|=bit;
-                }
-                FlatMap<size_t,DedupKey,DedupHash> winners;
-                winners.reserve(part.size()/8);
-                for(size_t i=0;i<part.size();++i) {
-                    uint16_t tag=tags[i];
-                    if(!(repeated[tag>>6]&(uint64_t{1}<<(tag&63))))continue;
-                    const auto& row=part[i];
-                    auto [entry,added]=winners.try_emplace(row.id,i);
-                    if(added)continue;
-                    const auto& current=part[entry->second];
-                    if(earlier(row,current)){drop(current);entry->second=i;}
-                    else drop(row);
-                }
+            FlatMap<size_t,DedupKey,DedupHash> winners;
+            winners.reserve(part.size()/8);
+            for(size_t i=0;i<part.size();++i) {
+                uint16_t tag=tags[i];
+                if(!(repeated[tag>>6]&(uint64_t{1}<<(tag&63))))continue;
+                const auto& row=part[i];
+                auto [entry,added]=winners.try_emplace(row.id,i);
+                if(added)continue;
+                const auto& current=part[entry->second];
+                if(earlier(row,current)){drop(current);entry->second=i;}
+                else drop(row);
             }
-        });
+        }
+    }
+    template<class R,class Buffer>void mark_duplicate_locations(std::vector<std::vector<Buffer>>& raw) {
+        parallel(o.ingest_shards,o.threads,[&](size_t s,int){mark_duplicate_shard<R>(raw,s);});
     }
     template<class R,class Buffer> void dedup(std::vector<std::vector<Buffer>>& raw) {
         parallel(o.ingest_shards,o.threads,[&](size_t s,int worker){
@@ -838,22 +844,89 @@ struct Pipeline {
         }
         winners.each([&](const EventId&,size_t row){emit(rows[row]);});
     }
-    void parse_clicks() {
-        parallel(in.clicks.size(),o.threads,[&](size_t i,int worker){
-            records<4>(in.clicks[i],[&](const std::array<SV,4>& f){
-                if(f[0].empty()||f[1].empty())return;
-                auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
-                auto ts=parse_time(f[3]);if(ts==-1||ts<start-WEEK||ts>=end)return;
-                auto person=Key(f[1]);
-                if(!o.redirect_linked_groups)person=canonical(person);
-                size_t destination=shard(person);
-                Key id(f[0]);
-                if(routed_clicks.empty())clicks[worker][destination].push_back({person,id,ts,it->second});
-                else routed_clicks[worker][destination].push_back({person,id,uint32_t(ts-(start-WEEK)),it->second});
-            });
+    void parse_click_chunk(size_t i,int worker) {
+        records<4>(in.clicks[i],[&](const std::array<SV,4>& f){
+            if(f[0].empty()||f[1].empty())return;
+            auto it=campaigns.find(f[2]);if(it==campaigns.end())return;
+            auto ts=parse_time(f[3]);if(ts==-1||ts<start-WEEK||ts>=end)return;
+            auto person=Key(f[1]);
+            if(!o.redirect_linked_groups)person=canonical(person);
+            size_t destination=shard(person);
+            Key id(f[0]);
+            if(routed_clicks.empty())clicks[worker][destination].push_back({person,id,ts,it->second});
+            else routed_clicks[worker][destination].push_back({person,id,uint32_t(ts-(start-WEEK)),it->second});
         });
+    }
+    void parse_clicks() {
+        parallel(in.clicks.size(),o.threads,[&](size_t i,int worker){parse_click_chunk(i,worker);});
         // Identical duplicate clicks need no materialized dedup: they cannot
         // change the winning (timestamp,id), nor campaign membership in a window.
+    }
+    template<class R,class Buffer>void ingest_dag(std::vector<std::vector<Buffer>>& raw,
+                                                  CachedEventBuckets* indirect,bool click_tail) {
+        enum class InputKind {links,event,click};
+        struct InputJob {InputKind kind;size_t index;};
+        const size_t event_chunks=in.events.size(),click_chunks=in.clicks.size();
+        std::vector<InputJob> input;
+        input.reserve(event_chunks+click_chunks+size_t(o.overlap_links));
+        if(o.overlap_links)input.push_back({InputKind::links,0});
+        size_t click=0;
+        for(size_t event=0;event<event_chunks;++event) {
+            input.push_back({InputKind::event,event});
+            if(!click_tail) {
+                const size_t through=click_chunks*(event+1)/event_chunks;
+                while(click<through)input.push_back({InputKind::click,click++});
+            }
+        }
+        while(click<click_chunks)input.push_back({InputKind::click,click++});
+
+        constexpr unsigned events_ready=1,cancelled=2;
+        std::atomic<size_t> pending_events{event_chunks};
+        std::atomic<unsigned> state{event_chunks?0u:events_ready};
+        std::atomic<size_t> next_input{0},next_dedup{0};
+        const size_t raw_jobs=o.ingest_shards,mapped_jobs=indirect?raw_jobs:0;
+        parallel(o.threads,o.threads,[&](size_t,int worker) {
+            try {
+                for(;;) {
+                    const unsigned ready=state.load(std::memory_order_acquire);
+                    if(ready&cancelled)return;
+                    if(ready&events_ready) {
+                        const size_t job=next_dedup.fetch_add(1,std::memory_order_relaxed);
+                        if(job<raw_jobs) {
+                            mark_duplicate_shard<R>(raw,job);
+                            continue;
+                        }
+                        if(job<raw_jobs+mapped_jobs) {
+                            mark_duplicate_shard<CachedRawLocation>(*indirect,job-raw_jobs);
+                            continue;
+                        }
+                    }
+                    const size_t job=next_input.fetch_add(1,std::memory_order_relaxed);
+                    if(job>=input.size()) {
+                        if(ready&events_ready)return;
+                        state.wait(ready,std::memory_order_acquire);
+                        continue;
+                    }
+                    const auto task=input[job];
+                    switch(task.kind) {
+                        case InputKind::links:build_links();break;
+                        case InputKind::click:parse_click_chunk(task.index,worker);break;
+                        case InputKind::event:
+                            parse_event_chunk<R>(raw,task.index,worker,indirect);
+                            // Publish every event buffer before dedup can mutate routed offsets.
+                            if(pending_events.fetch_sub(1,std::memory_order_acq_rel)==1) {
+                                state.fetch_or(events_ready,std::memory_order_release);
+                                state.notify_all();
+                            }
+                            break;
+                    }
+                }
+            } catch(...) {
+                state.fetch_or(cancelled,std::memory_order_release);
+                state.notify_all();
+                throw;
+            }
+        });
     }
     template<class T> static std::vector<T> gather(Workers<T>& workers,size_t s) {
         size_t n=0;for(auto& w:workers)n+=w[s].size();std::vector<T> r;r.reserve(n);
@@ -1436,8 +1509,30 @@ struct Pipeline {
         }
 #endif
         auto process_raw=[&](auto& raw) {
+            if constexpr(is_location_record<R>) {
+                if(const auto* mode=std::getenv("SHOP_INGEST_DAG");mode&&o.redirect_linked_groups&&o.threads>1) {
+                    ingest_dag<R>(raw,indirect,SV(mode)=="tail");
+                    clicks_parsed=true;
+                    timer.mark("ingest_dag");
+                    return;
+                }
+            }
             parse_events<R>(raw,indirect);
             timer.mark(o.overlap_links?"parse_events_and_links":"parse_events");
+            if constexpr(is_location_record<R>) {
+                if(std::getenv("SHOP_FUSE_DEDUP_CLICKS")) {
+                    const size_t raw_jobs=o.ingest_shards;
+                    const size_t mapped_jobs=indirect?raw_jobs:0;
+                    parallel(raw_jobs+mapped_jobs+in.clicks.size(),o.threads,[&](size_t job,int worker) {
+                        if(job<raw_jobs)mark_duplicate_shard<R>(raw,job);
+                        else if(job<raw_jobs+mapped_jobs)mark_duplicate_shard<CachedRawLocation>(*indirect,job-raw_jobs);
+                        else parse_click_chunk(job-raw_jobs-mapped_jobs,worker);
+                    });
+                    clicks_parsed=true;
+                    timer.mark("dedup_and_clicks");
+                    return;
+                }
+            }
             if constexpr(is_location_record<R>)mark_duplicate_locations<R>(raw);
             else dedup<R>(raw);
 #ifdef SHOP_SHORT_IDS
@@ -1478,7 +1573,7 @@ struct Pipeline {
         } else {
             ingest_and_dedup<Raw>(t);
         }
-        parse_clicks();t.mark("parse_clicks");
+        if(!clicks_parsed){parse_clicks();t.mark("parse_clicks");}
         if(o.redirect_linked_groups) {
             if(o.split_group_purchases)sessionize_linked_groups<true>();
             else sessionize_linked_groups();
