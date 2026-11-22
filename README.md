@@ -164,9 +164,9 @@ same source without PGO using `--build-arg BUILD_MODE=plain`.
 
 Set `CPUSET` to pin the container to specific logical CPUs. For a separate
 profiling run, set `SHOP_PROFILE_CPU=1` for per-stage wall and process CPU time
-and `SHOP_PROFILE_DETAIL=1` for the breakdown inside sessionization. Add
-`--worker-parquet` after the output path to compare one file per active worker
-with the default shard files. Worker files flush buffered rows into additional
-row groups as needed.
+and `SHOP_PROFILE_DETAIL=1` for link/CSV overlap and the sessionization
+breakdown. Add `--worker-parquet` after the output path to compare one file per
+active worker with the default shard files. Worker files flush buffered rows
+into additional row groups as needed.
 
 See [benchmark results](docs/benchmarks.md) for measured performance and limits.

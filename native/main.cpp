@@ -540,11 +540,25 @@ struct Pipeline {
     }
     template<class R,class Buffer> void parse_events(std::vector<std::vector<Buffer>>& raw,
                                                      [[maybe_unused]] CachedEventBuckets* indirect) {
+        struct alignas(64) ParseWorkerTiming {
+            Clock::time_point last_chunk;
+            size_t chunks=0;
+        };
+        const bool measure=profile_detail&&o.overlap_links&&!in.events.empty();
+        std::vector<ParseWorkerTiming> parse_times(measure?o.threads:0);
+        const auto phase_start=measure?Clock::now():Clock::time_point{};
+        Clock::time_point link_start,link_finish;
+        int link_worker=-1;
         parallel(in.events.size()+size_t(o.overlap_links),o.threads,[&](size_t i,int worker){
             if(o.overlap_links) {
                 // This job owns the link graph. The other jobs carry raw user
                 // IDs until the barrier, and therefore never read it early.
-                if(!i){build_links();return;}
+                if(!i) {
+                    if(measure){link_start=Clock::now();link_worker=worker;}
+                    build_links();
+                    if(measure)link_finish=Clock::now();
+                    return;
+                }
                 --i;
             }
             records<7>(in.events[i],[&](const std::array<SV,7>& f){
@@ -607,7 +621,28 @@ struct Pipeline {
                     raw[worker][bucket].push_back({event_id,person,ts,ingest,uint32_t(price),category});
                 }
             });
+            if(measure) {
+                parse_times[worker].last_chunk=Clock::now();
+                ++parse_times[worker].chunks;
+            }
         });
+        if(measure) {
+            auto csv_finish=phase_start;
+            size_t early_workers=0;
+            for(const auto& timing:parse_times) {
+                if(!timing.chunks)continue;
+                csv_finish=std::max(csv_finish,timing.last_chunk);
+                early_workers+=timing.last_chunk<link_finish;
+            }
+            const auto seconds=[](auto duration){return std::chrono::duration<double>(duration).count();};
+            std::cerr<<"event_link_overlap_seconds links="<<seconds(link_finish-link_start)
+                <<" links_finish="<<seconds(link_finish-phase_start)
+                <<" csv_finish="<<seconds(csv_finish-phase_start)
+                <<" links_tail="<<std::max(0.0,seconds(link_finish-csv_finish))
+                <<" early_csv_workers="<<early_workers
+                <<" link_worker_csv_chunks="<<parse_times[link_worker].chunks
+                <<" csv_chunks="<<in.events.size()<<'\n';
+        }
     }
     template<class Buffer>static void release_raw(Buffer& buffer) {
         if constexpr(requires {buffer.release();})buffer.release();

@@ -554,3 +554,19 @@ was 2.952 s for grouping and canonicalization, 1.161 s for sorting and
 temporal binning, 1.382 s for aggregation, and 0.241 s for user Parquet.
 Campaign reduction and output took 0.017 s of wall time. Users with zero
 valid clicks accounted for 1,201,194 of 3,417,672 sessions (35.1%).
+
+### Link graph and event CSV overlap
+
+With `SHOP_PROFILE_DETAIL=1`, `event_link_overlap_seconds` reports both
+finish times relative to the start of the shared phase. The link job
+includes reading the link CSV, building the disjoint-set graph, and
+finalizing the alias index. Its worker can take event chunks when it finishes.
+`links_tail` measures the wait after the final event chunk, if any.
+
+On the refreshed 20M benchmark with eight pinned workers, the GCC 14 PGO
+build finished the link job first in six of seven runs. Median finish times
+were **445 ms for links** and **498 ms for event CSV**. The link worker took
+16 to 69 event chunks in those six runs. In the other run all seven event
+workers finished first and the link job added **92 ms** at the barrier.
+The ordinary build finished links last in three of five runs, adding **4,
+17, and 45 ms**. Both reference tables matched in every run.
