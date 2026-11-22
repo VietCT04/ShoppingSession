@@ -490,3 +490,8 @@ only those bins removes the full bin scan for medium-sized groups. Two
 five-pair 20M batches measured **1.331 vs 1.336 seconds** and **1.300 vs
 1.322 seconds** against the dense-bin build. Every output matched the
 reference. Use `--sparse-bin-min-events 0` to time the dense-bin policy.
+
+The worker pool reserves route buffers in parallel. On the 20M benchmark,
+this lowered peak RSS by about 140 MiB and improved the five-pair medians
+from **1.329 to 1.293 seconds** and from **1.311 to 1.294 seconds**. Every
+output matched. Use `--serial-route-reserve` to compare the original allocation.
