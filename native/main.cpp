@@ -4,6 +4,7 @@
 #include "sort.hpp"
 #include "id.hpp"
 #include "short_id.hpp"
+#include "event_id.hpp"
 #include "csv_scan.hpp"
 #include "ingest_order.hpp"
 #include "ingest_arena.hpp"
@@ -39,25 +40,34 @@ SV text(const Id& s,ShortId::Buffer&){return s.view();}
 using Key=SV;using KeyHash=Hash;using PeopleType=People;
 SV text(SV s,ShortId::Buffer&){return s;}
 #endif
-template<class V>using KeyDict=std::unordered_map<Key,V,KeyHash>;
+#if defined(SHOP_SHORT_IDS) && !defined(SHOP_PLAIN_EVENT_HASH)
+using EventId=ReversibleEventId;
+using EventIdHash=ReversibleEventHash;
+#else
+using EventId=Key;
+using EventIdHash=KeyHash;
+#endif
+template<class V>using EventIdDict=std::unordered_map<EventId,V,EventIdHash>;
+template<class V>using EventIdFlatMap=FlatMap<V,EventId,EventIdHash>;
 template<class V>using KeyFlatMap=FlatMap<V,Key,KeyHash>;
 struct DenseKeyHash {
     using is_avalanching=void;
-    size_t operator()(const Key& key)const noexcept {auto h=KeyHash{}(key);return h^(h>>32);}
+    size_t operator()(const EventId& key)const noexcept {auto h=EventIdHash{}(key);return h^(h>>32);}
 };
-struct Raw {Key id,person;int64_t ts,ingest;uint32_t price,category;};
-struct RawLocation {Key id;int64_t ingest;uint64_t location;};
-struct NarrowRawLocation {Key id;NarrowLocation location;};
-static_assert(sizeof(NarrowRawLocation)==sizeof(Key)+8);
+struct Raw {EventId id;Key person;int64_t ts,ingest;uint32_t price,category;};
+struct RawLocation {EventId id;int64_t ingest;uint64_t location;};
+struct NarrowRawLocation {EventId id;NarrowLocation location;};
+static_assert(sizeof(NarrowRawLocation)==sizeof(EventId)+8);
 template<class R>constexpr bool is_location_record=std::is_same_v<R,RawLocation>||std::is_same_v<R,NarrowRawLocation>;
 struct CompactRaw {
-    Key id,person;
+    EventId id;
+    Key person;
     int64_t ingest;
     uint32_t offset,purchase;
     static constexpr uint32_t invalid=UINT32_MAX;
     static constexpr uint32_t price_mask=(1u<<24)-1;
 };
-static_assert(sizeof(CompactRaw)==2*sizeof(Key)+16);
+static_assert(sizeof(CompactRaw)==sizeof(EventId)+sizeof(Key)+16);
 struct Event {
     Key person;int64_t ts;uint32_t price,category;
     bool operator<(const Event& b)const{return person!=b.person?person<b.person:ts<b.ts;}
@@ -284,7 +294,7 @@ struct Pipeline {
     using Clock=std::chrono::steady_clock;
     static double elapsed(Clock::time_point t){return std::chrono::duration<double>(Clock::now()-t).count();}
     size_t shard(Key s)const{return KeyHash{}(s)&(o.shards-1);}
-    size_t event_shard(Key s)const{return KeyHash{}(s)&(o.dedup_shards-1);}
+    size_t event_shard(EventId s)const{return EventIdHash{}(s)&(o.dedup_shards-1);}
     template<class T>
     void reserve_routes(Workers<T>& routes,const std::vector<Chunk>& chunks,size_t bytes_per_row) {
         if(routes.empty())return;
@@ -471,10 +481,10 @@ struct Pipeline {
                     if(valid){auto it=products.find(f[5]);if(it!=products.end())category=it->second;}
                 }
                 if(!valid)ts=-1;
-                Key event_id(f[0]);
+                EventId event_id(f[0]);
                 Key user_id(f[1]);
                 Key person=o.overlap_links?user_id:canonical(user_id);
-                size_t bucket=KeyHash{}(event_id)&(o.ingest_shards-1);
+                size_t bucket=EventIdHash{}(event_id)&(o.ingest_shards-1);
                 if constexpr(is_location_record<R>) {
                     size_t destination=0,index=0;
                     if(valid) {
@@ -532,13 +542,13 @@ struct Pipeline {
                 std::vector<uint16_t> tags;
                 tags.reserve(part.size());
                 for(const auto& row:part) {
-                    uint16_t tag=uint64_t(KeyHash{}(row.id))>>32;
+                    uint16_t tag=uint64_t(EventIdHash{}(row.id))>>32;
                     tags.push_back(tag);
                     uint64_t bit=uint64_t{1}<<(tag&63);
                     repeated[tag>>6]|=seen[tag>>6]&bit;
                     seen[tag>>6]|=bit;
                 }
-                KeyFlatMap<size_t> winners;
+                EventIdFlatMap<size_t> winners;
                 winners.reserve(part.size()/8);
                 for(size_t i=0;i<part.size();++i) {
                     uint16_t tag=tags[i];
@@ -619,7 +629,7 @@ struct Pipeline {
                 }
                 for(auto& rows:subpartitions)if(!rows.empty())dedup_rows(rows,emit);
             } else if(o.direct_dedup&&o.dedup=="flat") {
-                KeyFlatMap<const R*> winners;
+                EventIdFlatMap<const R*> winners;
                 winners.reserve(count);
                 for(const auto& buckets:raw) {
                     for(const auto& event:buckets[s]) {
@@ -627,7 +637,7 @@ struct Pipeline {
                         if(!inserted&&event.ingest<entry->second->ingest)entry->second=&event;
                     }
                 }
-                winners.each([&](const Key&,const R* event){emit(*event);});
+                winners.each([&](const EventId&,const R* event){emit(*event);});
                 for(auto& buckets:raw)release_raw(buckets[s]);
             } else {
                 std::vector<R> rows;rows.reserve(count);
@@ -645,15 +655,15 @@ struct Pipeline {
             return;
         }
         if(o.dedup=="dense") {
-            ankerl::unordered_dense::map<Key,size_t,DenseKeyHash> winners;winners.reserve(rows.size());
+            ankerl::unordered_dense::map<EventId,size_t,DenseKeyHash> winners;winners.reserve(rows.size());
             for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
             for(auto [id,i]:winners)emit(rows[i]);
         } else if(o.dedup=="flat") {
-            KeyFlatMap<size_t> winners;winners.reserve(rows.size());
+            EventIdFlatMap<size_t> winners;winners.reserve(rows.size());
             for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
-            winners.each([&](Key,size_t i){emit(rows[i]);});
+            winners.each([&](EventId,size_t i){emit(rows[i]);});
         } else if(o.dedup=="hash") {
-            KeyDict<size_t> winners;winners.reserve(rows.size());
+            EventIdDict<size_t> winners;winners.reserve(rows.size());
             for(size_t i=0;i<rows.size();++i){auto [it,added]=winners.try_emplace(rows[i].id,i);if(!added&&rows[i].ingest<rows[it->second].ingest)it->second=i;}
             for(auto [id,i]:winners)emit(rows[i]);
         } else {
@@ -668,13 +678,13 @@ struct Pipeline {
         std::vector<uint16_t> tags;
         tags.reserve(rows.size());
         for(const auto& event:rows) {
-            uint16_t tag=uint64_t(KeyHash{}(event.id))>>32;
+            uint16_t tag=uint64_t(EventIdHash{}(event.id))>>32;
             tags.push_back(tag);
             const uint64_t bit=uint64_t{1}<<(tag&63);
             shared[tag>>6]|=seen[tag>>6]&bit;
             seen[tag>>6]|=bit;
         }
-        KeyFlatMap<size_t> winners;
+        EventIdFlatMap<size_t> winners;
         winners.reserve(rows.size()/8);
         for(size_t i=0;i<rows.size();++i) {
             const auto tag=tags[i];
@@ -686,7 +696,7 @@ struct Pipeline {
             auto [entry,inserted]=winners.try_emplace(event.id,i);
             if(!inserted&&event.ingest<rows[entry->second].ingest)entry->second=i;
         }
-        winners.each([&](const Key&,size_t row){emit(rows[row]);});
+        winners.each([&](const EventId&,size_t row){emit(rows[row]);});
     }
     void parse_clicks() {
         parallel(in.clicks.size(),o.threads,[&](size_t i,int worker){

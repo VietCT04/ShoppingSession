@@ -3,6 +3,7 @@
 #include "../native/flat_map.hpp"
 #include "../native/id.hpp"
 #include "../native/short_id.hpp"
+#include "../native/event_id.hpp"
 #include "../native/csv_scan.hpp"
 #include "../native/ingest_order.hpp"
 #include "../native/sparse_state.hpp"
@@ -76,6 +77,10 @@ int main(){try{
         require(x.view(left)==a&&y.view(right)==b,"8-byte keys preserve exact bytes");
         require((x==y)==(a==b)&&(x<y)==(SV(a)<SV(b)),"8-byte keys preserve lexical order");
         if(a==b)require(ShortIdHash{}(x)==ShortIdHash{}(y),"equal 8-byte keys hash equally");
+        ReversibleEventId event_a(a),event_b(b);
+        require((event_a==event_b)==(a==b),"mixed event ID keeps exact equality");
+        require((!(event_a<event_b)&&!(event_b<event_a))==(a==b),"mixed event ID comparison groups equal keys");
+        if(a==b)require(event_a.hash()==event_b.hash(),"equal mixed event IDs hash equally");
     }
     {
         std::string large(40000,'A');

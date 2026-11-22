@@ -436,3 +436,9 @@ delimits its purchases. On the UTC cache build, the five-pair 20M median
 was **1.372 vs 1.378 seconds** and peak RSS was about 60 MiB lower. An
 earlier paired batch measured **1.376 vs 1.397 seconds**. Every comparison
 matched the reference. Use `--inline-group-purchases` for the original layout.
+
+Short event IDs use a reversible bit permutation at ingest. The mixed word
+provides routing and fingerprint bits while keeping exact equality. Unusual
+IDs retain their original mapped bytes. Two five-pair 20M sets measured
+**1.343 vs 1.350 seconds** and **1.343 vs 1.359 seconds**, with exact reference
+matches in every run. Define `SHOP_PLAIN_EVENT_HASH` to build the control.
