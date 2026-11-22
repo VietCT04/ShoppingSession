@@ -72,7 +72,10 @@ int main(){try{
     FlatMap<uint32_t> map;
     std::vector<std::string> keys;keys.reserve(10000);
     for(size_t i=0;i<10000;++i)keys.push_back("exact key "+std::to_string(i));
-    for(size_t i=0;i<keys.size();++i)require(map.try_emplace(keys[i],i).second,"flat insert");
+    for(size_t i=0;i<keys.size();++i) {
+        const auto added=i%2?map.try_emplace<true>(keys[i],i,Hash{}(keys[i])).second:map.try_emplace(keys[i],i).second;
+        require(added,"flat insert with computed and supplied hashes");
+    }
     for(size_t i=0;i<keys.size();++i)require(map.find(keys[i])&&map.find(keys[i])->second==i,"flat growth preserves keys");
     require(!map.find("missing")&&!map.try_emplace(keys[9],55).second,"flat lookup and duplicate");
     map.freeze();

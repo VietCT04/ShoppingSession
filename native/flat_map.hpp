@@ -60,11 +60,12 @@ public:
         auto old=std::move(slots);slots.resize(capacity);used=0;
         for(auto& [key,value]:old)if(!empty(key))try_emplace(key,value);
     }
-    std::pair<Slot*,bool> try_emplace(Key key,V value) {
+    template<bool Prehashed=false>std::pair<Slot*,bool> try_emplace(Key key,V value,size_t hash=0) {
         tags.clear();
         if(empty(key))throw std::runtime_error("empty map key");
         if((used+1)*3>=slots.size()*2)reserve(used+1);
-        size_t at=bucket(Hasher{}(key),slots.size()-1);
+        if constexpr(!Prehashed)hash=Hasher{}(key);
+        size_t at=bucket(hash,slots.size()-1);
         while(!empty(slots[at].first)) {
             if(slots[at].first==key)return {&slots[at],false};
             at=(at+1)&(slots.size()-1);

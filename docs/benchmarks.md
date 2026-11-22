@@ -524,3 +524,12 @@ Mapped-event hash records use demand-paged ingest arenas. The five-pair
 20M medians were **1.466 vs 1.489 seconds** and **1.499 vs 1.509 seconds**.
 Every output matched, and peak RSS was about 55 MiB lower. Define
 `SHOP_VECTOR_INDIRECT_EVENTS` to compare vector-backed mapped-event records.
+
+For compact view and cart records, grouping reuses the user hash placed
+in the unused purchase payload. The timestamp marker stays clear when the
+window is too wide to reserve it. A short sample enables one-block-ahead
+prefetch for partitions with mapped user IDs. The prototype improved the
+five-pair median from **1.130 to 1.079 seconds**. The production build
+improved from **1.496 to 1.452 seconds** against the preceding source,
+with a same-binary comparison of **1.505 vs 1.469 seconds**. All outputs
+matched. Use `--plain-user-routes` to disable the cached hashes and prefetch.

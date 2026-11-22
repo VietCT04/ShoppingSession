@@ -86,6 +86,10 @@ struct Event {
 };
 struct Click {Key person,id;int64_t ts;uint32_t campaign;};
 struct RoutedEvent {Key person;uint32_t offset,purchase;};
+constexpr uint32_t route_hash_bit=uint32_t{1}<<31;
+struct UserGroupingHash {
+    size_t operator()(const Key& name)const noexcept{return uint64_t(KeyHash{}(name))>>32;}
+};
 struct RoutedClick {Key person,id;uint32_t offset,campaign;};
 static_assert(sizeof(RoutedEvent)==sizeof(Key)+8);
 static_assert(sizeof(RoutedClick)==2*sizeof(Key)+8);
@@ -175,6 +179,7 @@ struct Options {
     bool mark_duplicate_events=true;
     bool narrow_duplicate_locations=true;
     bool cache_indirect_events=true;
+    bool cache_routed_users=true;
     bool branchless_event_validation=true;
     bool reserve_routes=true;
     bool parallel_route_reserve=true;
@@ -255,6 +260,8 @@ Options options(int argc,char** argv) {
         else if(arg=="--wide-duplicate-locations")o.narrow_duplicate_locations=false;
         else if(arg=="--cached-indirect-events")o.cache_indirect_events=true;
         else if(arg=="--uncached-indirect-events")o.cache_indirect_events=false;
+        else if(arg=="--cached-user-routes")o.cache_routed_users=true;
+        else if(arg=="--plain-user-routes")o.cache_routed_users=false;
         else if(arg=="--branchless-event-validation")o.branchless_event_validation=true;
         else if(arg=="--conditional-event-validation")o.branchless_event_validation=false;
         else if(arg=="--reserve-routes")o.reserve_routes=true;
@@ -329,6 +336,7 @@ struct Pipeline {
     std::vector<WorkProfile> profiles;
     std::unique_ptr<LocationCodec> location_codec;
     std::unique_ptr<WorkerPool> workers;
+    bool cache_user_hashes=false;
     explicit Pipeline(Options options):o(std::move(options)),
         events(o.threads,Buckets<Event>(o.shards)),clicks(o.threads,Buckets<Click>(o.shards)),totals(o.threads),profiles(o.threads){}
     using Clock=std::chrono::steady_clock;
@@ -550,11 +558,18 @@ struct Pipeline {
                 if constexpr(is_location_record<R>) {
                     size_t destination=0,index=0;
                     if(valid) {
-                        destination=shard(person);
+                        const size_t person_hash=KeyHash{}(person);
+                        destination=person_hash&(o.shards-1);
+                        uint32_t offset=uint32_t(ts-start),payload=uint32_t(price)|(category<<24);
+                        if(cache_user_hashes&&!price) {
+                            // The purchase payload is free on views and carts.
+                            offset|=route_hash_bit;
+                            payload=uint64_t(person_hash)>>32;
+                        }
                         auto& target=routed_events[worker][destination];
                         if(target.size()>=UINT32_MAX)throw std::runtime_error("too many events in one worker partition");
                         index=target.size()+1;
-                        target.push_back({person,uint32_t(ts-start),uint32_t(price)|(category<<24)});
+                        target.push_back({person,offset,payload});
                     }
                     if constexpr(std::is_same_v<R,NarrowRawLocation>) {
                         auto location=location_codec->encode(ingest,worker,destination,index);
@@ -795,9 +810,30 @@ struct Pipeline {
         for(const auto& buckets:workers)count+=buckets[shard].size();
         return count;
     }
-    template<class T,class F> static void consume_bucket(Workers<T>& workers,size_t shard,F consume) {
+    template<class T,class F> static void consume_bucket(Workers<T>& workers,size_t shard,F consume,
+                                                         [[maybe_unused]] bool prefetch_users=false) {
         for(auto& buckets:workers) {
             auto& records=buckets[shard];
+#ifdef SHOP_SHORT_IDS
+            if constexpr(std::is_same_v<T,RoutedEvent>||std::is_same_v<T,RoutedClick>) {
+                constexpr size_t batch=64;
+                const auto sample=std::span(records).first(std::min(batch,records.size()));
+                if(prefetch_users&&std::any_of(sample.begin(),sample.end(),[](const auto& row){return row.person.indirect();})) {
+                    for(size_t begin=0;begin<records.size();begin+=batch) {
+                        const size_t end=std::min(begin+batch,records.size());
+                        const size_t ahead=std::min(end+batch,records.size());
+                        for(size_t i=end;i<ahead;++i) {
+                            const auto& person=records[i].person;
+                            if(person.indirect()&&!(person.word&ShortId::extra_bit))
+                                __builtin_prefetch(reinterpret_cast<const char*>(person.word&ShortId::pointer_mask),0,1);
+                        }
+                        for(size_t i=begin;i<end;++i)consume(records[i]);
+                    }
+                    std::vector<T>().swap(records);
+                    continue;
+                }
+            }
+#endif
             for(const auto& record:records)consume(record);
             std::vector<T>().swap(records);
         }
@@ -969,11 +1005,11 @@ struct Pipeline {
         Workers<Group> grouped(o.threads,Buckets<Group>(o.shards));
         parallel(o.shards,o.threads,[&](size_t s,int worker) {
             auto before=Clock::now();
-            KeyFlatMap<uint32_t> codes;
+            FlatMap<uint32_t,Key,UserGroupingHash> codes;
             std::vector<Key> names;
             std::vector<size_t> event_counts,click_counts,purchase_counts;
-            auto person_code=[&](Key name) {
-                auto [entry,added]=codes.try_emplace(name,names.size());
+            auto person_code=[&](Key name,bool cached=false,uint32_t hash=0) {
+                auto [entry,added]=cached?codes.try_emplace<true>(name,names.size(),hash):codes.try_emplace(name,names.size());
                 if(added) {
                     names.push_back(name);event_counts.push_back(0);click_counts.push_back(0);
                     if constexpr(SplitPurchases)purchase_counts.push_back(0);
@@ -984,22 +1020,25 @@ struct Pipeline {
             std::vector<PurchaseInput> purchases;
             consume_bucket(routed_events,s,[&](const RoutedEvent& event) {
                 if(o.mark_duplicate_events&&event.offset==CompactRaw::invalid)return;
-                auto code=person_code(event.person);
+                uint32_t offset=event.offset,purchase=event.purchase;
+                const bool cached=cache_user_hashes&&(offset&route_hash_bit);
+                auto code=person_code(event.person,cached,purchase);
+                if(cached){offset&=~route_hash_bit;purchase=0;}
                 ++event_counts[code];
                 if constexpr(SplitPurchases) {
-                    ev.push_back({{event.offset},code});
-                    if(event.purchase) {
-                        purchases.push_back({{event.offset,event.purchase},code});
+                    ev.push_back({{offset},code});
+                    if(purchase) {
+                        purchases.push_back({{offset,purchase},code});
                         ++purchase_counts[code];
                     }
-                } else ev.push_back({{event.offset,event.purchase},code});
-            });
+                } else ev.push_back({{offset,purchase},code});
+            },o.cache_routed_users);
             std::vector<ClickInput> cl;cl.reserve(click_bucket_size(s));
             consume_bucket(routed_clicks,s,[&](const RoutedClick& click) {
                 auto code=person_code(click.person);
                 ++click_counts[code];
                 cl.push_back({{click.id,click.offset,click.campaign},code});
-            });
+            },o.cache_routed_users);
             auto& source=sources[s];
             source.events=group_records<EventInput,GroupEvent>(ev,event_counts,[](const EventInput& row){return row.event;});
             source.clicks=group_records<ClickInput,LinkedClick>(cl,click_counts,[](const ClickInput& row){return row.click;});
@@ -1324,6 +1363,8 @@ struct Pipeline {
         bool narrow_raw=o.compact_raw&&uint64_t(end-start)<=UINT32_MAX&&categories.size()<=256;
         o.mark_duplicate_events=o.mark_duplicate_events&&narrow_raw&&o.redirect_linked_groups&&
             o.sparse_duplicates&&o.dedup=="flat";
+        // The tagged offset must leave UINT32_MAX available for duplicate losers.
+        cache_user_hashes=o.cache_routed_users&&o.mark_duplicate_events&&uint64_t(end-start)<route_hash_bit;
         if(narrow_raw) {
             if(o.mark_duplicate_events&&o.narrow_duplicate_locations&&!o.ordered_ingest&&o.threads<=8) {
                 location_codec=std::make_unique<LocationCodec>(start-WEEK,o.threads,o.shards);
