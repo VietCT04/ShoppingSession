@@ -13,6 +13,7 @@
 #include "fast_time.hpp"
 #include "worker_pool.hpp"
 #include "gap_sessions.hpp"
+#include "sharded_people.hpp"
 #include "../third_party/unordered_dense/ankerl/unordered_dense.h"
 #ifdef SHOP_IPS_SORTS
 #include "ips4o.hpp"
@@ -328,6 +329,10 @@ struct Pipeline {
     Options o;
     Inputs in;
     PeopleType people;
+#ifdef SHOP_SHORT_IDS
+    ShardedPeople<Key,KeyHash,UserGroupingHash> grouping_people;
+    bool direct_canonical_rows=false;
+#endif
     KeyFlatMap<uint32_t> person_lookup;
     FlatMap<uint32_t> products,campaigns;
     Dict<uint32_t> category_index;
@@ -421,6 +426,10 @@ struct Pipeline {
         for(auto p:files(o.data/"links"))in.add(p,in.links);
         o.redirect_linked_groups=o.redirect_linked_groups&&o.overlap_links&&
             !in.links.empty()&&!routed_events.empty()&&!routed_clicks.empty();
+#ifdef SHOP_SHORT_IDS
+        direct_canonical_rows=o.redirect_linked_groups&&o.fuse_isolated_groups&&o.inline_short_links&&
+            o.split_group_purchases&&o.specialize_aggregation&&o.array_active&&o.array_categories&&o.dense_totals;
+#endif
         if(!o.overlap_links)build_links();
         for(auto p:files(o.data/"events"))in.add(p,in.events);
         for(auto p:files(o.data/"clicks"))in.add(p,in.clicks);
@@ -450,30 +459,29 @@ struct Pipeline {
         for(auto table:{"user_daily","campaign_daily"})for(auto p:files_parquet(o.out/table))fs::remove(p);
     }
     void build_links() {
+        size_t edges=0;
         if(o.reserve_links) {
             constexpr size_t reserve_limit=1u<<20;
-            size_t edges=0;
             for(auto chunk:in.links) {
                 edges+=std::count(chunk.begin,chunk.end,'\n')+(chunk.begin!=chunk.end&&chunk.end[-1]!='\n');
                 if(edges>=reserve_limit){edges=reserve_limit;break;}
             }
-            if(edges) {
-                people.index.reserve(edges);
-                people.parents.reserve(edges);
-                people.sizes.reserve(edges);
-                people.names.reserve(edges);
-            }
         }
-        auto join=[&](const std::array<SV,2>& fields) {
-            if(!fields[0].empty()&&!fields[1].empty())people.join(Key(fields[0]),Key(fields[1]));
-        };
-        for(auto chunk:in.links) {
-            if(o.fast_link_csv)records<2>(chunk,join);
-            else Inputs::lines(chunk,[&](SV line) {
-                std::array<SV,2> fields;
-                if(csv(line,fields))join(fields);
-            });
+#ifdef SHOP_SHORT_IDS
+        if(direct_canonical_rows) {
+            grouping_people.init(o.shards,edges);
+            read_links(grouping_people);
+            grouping_people.finish();
+            return;
         }
+#endif
+        if(edges) {
+            people.index.reserve(edges);
+            people.parents.reserve(edges);
+            people.sizes.reserve(edges);
+            people.names.reserve(edges);
+        }
+        read_links(people);
 #ifdef SHOP_SHORT_IDS
         people.finish(o.inline_short_links);
 #else
@@ -490,6 +498,18 @@ struct Pipeline {
             std::vector<uint32_t>().swap(people.parents);std::vector<uint32_t>().swap(people.sizes);
         }
 #endif
+    }
+    template<class Graph>void read_links(Graph& graph)const {
+        auto join=[&](const std::array<SV,2>& fields) {
+            if(!fields[0].empty()&&!fields[1].empty())graph.join(Key(fields[0]),Key(fields[1]));
+        };
+        for(auto chunk:in.links) {
+            if(o.fast_link_csv)records<2>(chunk,join);
+            else Inputs::lines(chunk,[&](SV line) {
+                std::array<SV,2> fields;
+                if(csv(line,fields))join(fields);
+            });
+        }
     }
     static std::vector<fs::path> files_parquet(const fs::path& dir) {
         std::vector<fs::path> r;for(auto& p:fs::directory_iterator(dir))if(p.is_regular_file()&&p.path().extension()==".parquet")r.push_back(p.path());return r;
@@ -1021,6 +1041,122 @@ struct Pipeline {
         std::vector<T>().swap(input);
         return {std::move(output),sum};
     }
+#ifdef SHOP_SHORT_IDS
+    template<class Row>struct CodedGroupRow {Row value;uint32_t person;};
+
+    template<class Input,class Row>static Grouped<Row> collect_root_rows(Workers<Input>& workers,size_t shard,
+                                                                         std::vector<size_t>& counts) {
+        for(auto& buckets:workers)for(const auto& row:buckets[shard])++counts[row.person];
+        size_t total=0;
+        for(auto& count:counts){total+=count;count=total;}
+        counts.push_back(total);
+        std::unique_ptr<Row[]> data(new Row[total]);
+        for(auto& buckets:workers) {
+            auto& rows=buckets[shard];
+            for(const auto& row:rows)data[--counts[row.person]]=row.value;
+            std::vector<Input>().swap(rows);
+        }
+        return {std::move(data),total};
+    }
+
+    template<class Group,class ConsumeGroup>void sessionize_direct_canonical_rows(ConsumeGroup consume_group) {
+        using TimeRow=CodedGroupRow<LinkedTimestamp>;
+        using ClickRow=CodedGroupRow<LinkedClick>;
+        using PurchaseRow=CodedGroupRow<LinkedEvent>;
+        const size_t linked_shards=std::min(o.shards,64);
+        Workers<TimeRow> linked_events(o.threads,Buckets<TimeRow>(linked_shards));
+        Workers<ClickRow> linked_clicks(o.threads,Buckets<ClickRow>(linked_shards));
+        Workers<PurchaseRow> linked_purchases(o.threads,Buckets<PurchaseRow>(linked_shards));
+        const unsigned shift=std::countr_zero(linked_shards);
+        const auto mask=linked_shards-1;
+
+        parallel(o.shards,o.threads,[&](size_t s,int worker) {
+            auto before=Clock::now();
+            auto& users=grouping_people.index[s];
+            std::vector<Key> names;
+            std::vector<size_t> event_counts,click_counts,purchase_counts;
+            struct Destination {uint32_t number;bool linked;};
+            auto destination=[&](Key name,bool cached=false,uint32_t hash=0)->Destination {
+                auto* entry=(cached?users.try_emplace<true>(name,UINT32_MAX,hash):users.try_emplace(name,UINT32_MAX)).first;
+                auto stored=uint32_t(entry->second);
+                const auto code=uint32_t(entry->second>>32);
+                if(stored!=UINT32_MAX) {
+                    if(!code) {
+                        stored=grouping_people.component(stored);
+                        entry->second=(uint64_t{1}<<32)|stored;
+                    }
+                    return {stored,true};
+                }
+                if(code)return {code-1,false};
+                const size_t next=names.size();
+                if(next>=UINT32_MAX)throw std::runtime_error("too many independent users");
+                entry->second=(uint64_t(next+1)<<32)|UINT32_MAX;
+                names.push_back(name);event_counts.push_back(0);click_counts.push_back(0);purchase_counts.push_back(0);
+                return {uint32_t(next),false};
+            };
+            std::vector<TimeRow> events;events.reserve(event_bucket_size(s)/2);
+            std::vector<ClickRow> clicks;clicks.reserve(click_bucket_size(s)/2);
+            std::vector<PurchaseRow> purchases;
+            consume_bucket(routed_events,s,[&](const RoutedEvent& event) {
+                if(o.mark_duplicate_events&&event.offset==CompactRaw::invalid)return;
+                uint32_t offset=event.offset,purchase=event.purchase;
+                const bool cached=cache_user_hashes&&(offset&route_hash_bit);
+                const auto target=destination(event.person,cached,purchase);
+                if(cached){offset&=~route_hash_bit;purchase=0;}
+                if(target.linked) {
+                    const size_t shard=target.number&mask;
+                    const uint32_t code=target.number>>shift;
+                    linked_events[worker][shard].push_back({{offset},code});
+                    if(purchase)linked_purchases[worker][shard].push_back({{offset,purchase},code});
+                } else {
+                    ++event_counts[target.number];events.push_back({{offset},target.number});
+                    if(purchase){++purchase_counts[target.number];purchases.push_back({{offset,purchase},target.number});}
+                }
+            },o.cache_routed_users);
+            consume_bucket(routed_clicks,s,[&](const RoutedClick& click) {
+                const auto target=destination(click.person);
+                const LinkedClick record{click.id,click.offset,click.campaign};
+                if(target.linked)linked_clicks[worker][target.number&mask].push_back({record,target.number>>shift});
+                else {++click_counts[target.number];clicks.push_back({record,target.number});}
+            },o.cache_routed_users);
+            if(events.empty()) {
+                profiles[worker].intern+=elapsed(before);
+                return;
+            }
+            const auto event_data=group_records<TimeRow,LinkedTimestamp>(events,event_counts,[](const TimeRow& row){return row.value;});
+            const auto click_data=group_records<ClickRow,LinkedClick>(clicks,click_counts,[](const ClickRow& row){return row.value;});
+            const auto purchase_data=group_records<PurchaseRow,LinkedEvent>(purchases,purchase_counts,[](const PurchaseRow& row){return row.value;});
+            profiles[worker].intern+=elapsed(before);
+            auto enumerate=[&](auto consume) {
+                for(size_t i=0;i<names.size();++i) {
+                    auto span=[&](const auto& data,const auto& offsets){return std::span(data.data.get()+offsets[i],offsets[i+1]-offsets[i]);};
+                    consume_group(Group{names[i],span(event_data,event_counts),span(click_data,click_counts),
+                        span(purchase_data,purchase_counts)},consume,worker);
+                }
+            };
+            aggregate_users<true>(s,worker,event_data.size,enumerate,"part-independent-");
+        });
+        parallel(linked_shards,o.threads,[&](size_t s,int worker) {
+            auto before=Clock::now();
+            const auto& names=grouping_people.names;
+            const size_t slots=(names.size()+linked_shards-1-s)>>shift;
+            std::vector<size_t> event_counts(slots),click_counts(slots),purchase_counts(slots);
+            const auto events=collect_root_rows<TimeRow,LinkedTimestamp>(linked_events,s,event_counts);
+            const auto clicks=collect_root_rows<ClickRow,LinkedClick>(linked_clicks,s,click_counts);
+            const auto purchases=collect_root_rows<PurchaseRow,LinkedEvent>(linked_purchases,s,purchase_counts);
+            profiles[worker].intern+=elapsed(before);
+            auto enumerate=[&](auto consume) {
+                for(size_t i=0;i<slots;++i) {
+                    if(event_counts[i]==event_counts[i+1])continue;
+                    auto span=[&](const auto& data,const auto& offsets){return std::span(data.data.get()+offsets[i],offsets[i+1]-offsets[i]);};
+                    consume_group(Group{names[(i<<shift)+s],span(events,event_counts),span(clicks,click_counts),
+                        span(purchases,purchase_counts)},consume,worker);
+                }
+            };
+            aggregate_users<true>(s,worker,events.size,enumerate);
+        });
+    }
+#endif
     template<bool SplitPurchases=false>void sessionize_linked_groups() {
         using GroupEvent=std::conditional_t<SplitPurchases,LinkedTimestamp,LinkedEvent>;
         struct NoPurchases {};
@@ -1070,6 +1206,14 @@ struct Pipeline {
                 sorted(ev);
             }
         };
+#ifdef SHOP_SHORT_IDS
+        if constexpr(SplitPurchases) {
+            if(direct_canonical_rows) {
+                sessionize_direct_canonical_rows<Group>(consume_group);
+                return;
+            }
+        }
+#endif
         std::vector<Source> sources(o.shards);
         Workers<Group> grouped(o.threads,Buckets<Group>(o.shards));
         parallel(o.shards,o.threads,[&](size_t s,int worker) {
